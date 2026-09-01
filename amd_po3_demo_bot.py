@@ -284,8 +284,13 @@ class Bot:
                 telegram(f"AMD DEMO ERROR\nClose-all incomplete: {len(rem)} remain")
             else:
                 log.warning("CYCLE COMPLETE -> immediate new cycle")
-                telegram("AMD DEMO\nCYCLE COMPLETE\nAll positions closed. New cycle starts now.")
+                telegram("AMD DEMO\nCYCLE COMPLETE\nAll positions closed. Fresh scan starts now.")
+                # New basket cycle: old candle de-duplication must not block
+                # currently valid AMD signals from being reconsidered.
+                self.seen.clear()
                 self.last_scan=0
+                # Permit run() to scan in this same loop, while still respecting daily stop.
+                return self.daily_ok()
             return False
         if not self.daily_ok():
             if ps:self.b.close_all()
