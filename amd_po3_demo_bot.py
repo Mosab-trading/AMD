@@ -28,17 +28,22 @@ MIN_VOL=env("MIN_QUOTE_VOLUME",20_000_000,float)
 class Binance:
     def __init__(self):
         if not KEY or not SECRET: raise SystemExit("Missing Binance Demo API keys")
-        self.s=requests.Session(); self.s.headers["X-MBX-APIKEY"]=KEY
+        self.s=requests.Session(); self.s.headers.update({"X-MBX-APIKEY":KEY,"User-Agent":"AMDPO3Demo/1.1"})
+        self.time_offset=0
+        self.sync_time()
         self.info=self.get("/fapi/v1/exchangeInfo")
         self.meta={x["symbol"]:x for x in self.info["symbols"]}
     def get(self,p,params=None):
         r=self.s.get(BASE+p,params=params,timeout=20); r.raise_for_status(); return r.json()
     def signed(self,m,p,params=None):
-        q=dict(params or {}); q["timestamp"]=int(time.time()*1000); q["recvWindow"]=5000
-        raw=urlencode(q); sig=hmac.new(SECRET.encode(),raw.encode(),hashlib.sha256).hexdigest()
-        r=self.s.request(m,BASE+p+"?"+raw+"&signature="+sig,timeout=20)
-        if not r.ok: raise RuntimeError(r.text)
+        q=dict(params or {}); q["timestamp"]=int(time.time()*1000)+self.time_offset; q.setdefault("recvWindow",10000)
+        raw=urlencode(q,doseq=True); sig=hmac.new(SECRET.encode(),raw.encode(),hashlib.sha256).hexdigest()
+        r=self.s.request(m,BASE+p+"?"+raw+"&signature="+sig,timeout=25)
+        if not r.ok: raise RuntimeError(f"Binance {r.status_code}: {r.text[:500]}")
         return r.json()
+    def sync_time(self):
+        server=self.get("/fapi/v1/time")["serverTime"]
+        self.time_offset=int(server)-int(time.time()*1000)
     def positions(self):
         return [x for x in self.signed("GET","/fapi/v2/positionRisk") if abs(float(x["positionAmt"]))>0]
     def wallet(self):
