@@ -64,6 +64,11 @@ class Binance:
         return [x for x in self.signed("GET","/fapi/v2/positionRisk") if abs(float(x["positionAmt"]))>0]
     def wallet(self):
         return float(self.signed("GET","/fapi/v2/account")["totalWalletBalance"])
+    def realized_pnl(self,s,since_ms):
+        rows=self.signed("GET","/fapi/v1/income",{
+            "symbol":s,"incomeType":"REALIZED_PNL","startTime":int(since_ms),"limit":100
+        })
+        return sum(float(x.get("income",0)) for x in rows)
     def symbols(self):
         ok={s for s,x in self.meta.items() if x.get("status")=="TRADING" and x.get("quoteAsset")=="USDT" and x.get("contractType")=="PERPETUAL"}
         rows=self.get("/fapi/v1/ticker/24hr")
@@ -266,17 +271,42 @@ def amd_po3_signal(df):
 class Bot:
     def __init__(self):
         self.b=Binance(); self.last_scan=0; self.seen={}; self.day=None; self.day_wallet=None
+        self.tracked={}
+        now=int(time.time()*1000)
+        for p in self.b.positions():
+            a=float(p["positionAmt"])
+            self.tracked[p["symbol"]]={"side":"LONG" if a>0 else "SHORT","opened_ms":now}
     def daily_ok(self):
         d=time.strftime("%Y-%m-%d",time.gmtime())
         if d!=self.day: self.day=d; self.day_wallet=self.b.wallet()
         return self.b.wallet()-self.day_wallet > -DAILY_STOP
+    def track_exchange_closes(self,ps):
+        current={p["symbol"] for p in ps}
+        for s,meta in list(self.tracked.items()):
+            if s in current:
+                continue
+            try:
+                pnl=self.b.realized_pnl(s,meta["opened_ms"])
+                reason="TAKE PROFIT" if pnl>0 else ("STOP LOSS" if pnl<0 else "EXCHANGE CLOSE")
+                msg=f"CLOSED {s} {meta['side']} | {reason} | Realized PnL: ${pnl:+.2f}"
+                log.warning(msg)
+                telegram("AMD DEMO\n"+msg)
+            except Exception as e:
+                log.error("CLOSE TRACK %s failed: %s",s,e)
+                telegram(f"AMD DEMO\nCLOSED {s} {meta['side']}\nPnL lookup failed: {e}")
+            finally:
+                self.tracked.pop(s,None)
+
     def risk(self):
         ps=self.b.positions()
+        self.track_exchange_closes(ps)
         pnl=sum(float(p.get("unRealizedProfit",0)) for p in ps)
         log.info("BASKET open_pnl=%+.2f target=%.2f positions=%d",pnl,BASKET,len(ps))
         if ps and pnl>=BASKET:
             log.warning("BASKET TARGET HIT %+.2f -> CLOSE ALL 100%%",pnl)
             telegram(f"AMD DEMO\nBASKET HIT ${pnl:+.2f}\nClosing all positions 100%")
+            for p in ps:
+                self.tracked.pop(p["symbol"],None)
             ok=self.b.close_all()
             rem=self.b.positions()
             if rem:
@@ -312,6 +342,7 @@ class Bot:
                 self.b.order(s,"BUY" if sig["side"]=="LONG" else "SELL",q)
                 try:
                     self.b.protect(s,sig["side"],sig["stop"],sig["target"])
+                    self.tracked[s]={"side":sig["side"],"opened_ms":int(time.time()*1000)}
                 except Exception as e:
                     log.exception("PROTECTION FAILED %s -> emergency close",s)
                     telegram(f"AMD DEMO ERROR\n{s} opened but SL/TP failed. Emergency closing.\n{e}")
