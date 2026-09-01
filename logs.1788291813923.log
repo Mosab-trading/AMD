@@ -1,0 +1,36 @@
+2026-09-01T19:43:04.967415132Z [err]  2026-09-01 19:43:04,965 ERROR name 'sma' is not defined
+2026-09-01T19:43:04.967425042Z [err]  Traceback (most recent call last):
+2026-09-01T19:43:04.967430282Z [err]    File "/app/futures_bot.py", line 391, in main
+2026-09-01T19:43:04.967434582Z [err]      if time.time()-last>=20:scan();last=time.time()
+2026-09-01T19:43:04.967438452Z [err]                              ^^^^^^
+2026-09-01T19:43:04.967444182Z [err]    File "/app/futures_bot.py", line 358, in scan
+2026-09-01T19:43:04.967447992Z [err]      new=sig("BTCUSDT")
+2026-09-01T19:43:04.967451832Z [err]          ^^^^^^^^^^^^^^
+2026-09-01T19:43:04.967455372Z [err]    File "/app/futures_bot.py", line 125, in sig
+2026-09-01T19:43:04.967459242Z [err]      m7=sma(closes,7); m25=sma(closes,25); m99=sma(closes,99)
+2026-09-01T19:43:04.967463172Z [err]         ^^^
+2026-09-01T19:43:04.967466942Z [err]  NameError: name 'sma' is not defined
+2026-09-01T19:43:10.464300135Z [err]  2026-09-01 19:43:10,458 ERROR name 'sma' is not defined
+2026-09-01T19:43:10.464302535Z [err]  Traceback (most recent call last):
+2026-09-01T19:43:10.464304965Z [err]    File "/app/futures_bot.py", line 391, in main
+2026-09-01T19:43:10.464308165Z [err]      if time.time()-last>=20:scan();last=time.time()
+2026-09-01T19:43:10.464310795Z [err]                              ^^^^^^
+2026-09-01T19:43:10.464313225Z [err]    File "/app/futures_bot.py", line 358, in scan
+2026-09-01T19:43:10.464315665Z [err]      new=sig("BTCUSDT")
+2026-09-01T19:43:10.464318415Z [err]          ^^^^^^^^^^^^^^
+2026-09-01T19:43:10.464320975Z [err]    File "/app/futures_bot.py", line 125, in sig
+2026-09-01T19:43:10.464323415Z [err]      m7=sma(closes,7); m25=sma(closes,25); m99=sma(closes,99)
+2026-09-01T19:43:10.464325755Z [err]         ^^^
+2026-09-01T19:43:10.464328405Z [err]  NameError: name 'sma' is not defined
+2026-09-01T19:43:15.960786547Z [err]  2026-09-01 19:43:15,955 ERROR name 'sma' is not defined
+2026-09-01T19:43:15.960790617Z [err]  Traceback (most recent call last):
+2026-09-01T19:43:15.960794727Z [err]    File "/app/futures_bot.py", line 391, in main
+2026-09-01T19:43:15.960799377Z [err]      if time.time()-last>=20:scan();last=time.time()
+2026-09-01T19:43:15.960803527Z [err]                              ^^^^^^
+2026-09-01T19:43:15.960807007Z [err]    File "/app/futures_bot.py", line 358, in scan
+2026-09-01T19:43:15.960810357Z [err]      new=sig("BTCUSDT")
+2026-09-01T19:43:15.960815047Z [err]          ^^^^^^^^^^^^^^
+2026-09-01T19:43:15.960818716Z [err]    File "/app/futures_bot.py", line 125, in sig
+2026-09-01T19:43:15.960822306Z [err]      m7=sma(closes,7); m25=sma(closes,25); m99=sma(closes,99)
+2026-09-01T19:43:15.960826696Z [err]         ^^^
+2026-09-01T19:43:15.960829766Z [err]  NameError: name 'sma' is not defined
