@@ -1,372 +1,183 @@
-import hashlib, hmac, logging, math, os, time
+import os,time,hmac,hashlib,json,logging
+from decimal import Decimal,ROUND_DOWN
 from urllib.parse import urlencode
-import numpy as np
-import pandas as pd
 import requests
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log=logging.getLogger("amd-demo")
+KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
+BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
+TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
+TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
+MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
+BASKET=20.0; LOSS_LIMIT=100.0
+S=requests.Session(); S.headers.update({"X-MBX-APIKEY":KEY})
+logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
+meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0
+STATE="state.json"
 
-def env(n,d,c=str):
-    v=os.getenv(n,d)
-    return (str(v).lower() in {"1","true","yes","on"}) if c is bool else c(v)
-
-KEY=os.getenv("BINANCE_DEMO_API_KEY","").strip().strip("\'\\\"")
-SECRET=os.getenv("BINANCE_DEMO_API_SECRET","").strip().strip("\'\\\"")
-BASE=env("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").strip().rstrip("/")
-LEV=env("LEVERAGE",20,int)
-NOTIONAL=env("POSITION_NOTIONAL",300.0,float)
-MAX_POS=env("MAX_POSITIONS",20,int)
-BASKET=env("BASKET_PROFIT_TARGET_USD",10.0,float)
-DAILY_STOP=env("DAILY_STOP_USD",50.0,float)
-TF=env("TIMEFRAME","5m")
-SCAN=env("SCAN_SECONDS",300,int)
-CHECK=env("CHECK_SECONDS",5,int)
-TOP_N=env("TOP_N",40,int)
-MIN_VOL=env("MIN_QUOTE_VOLUME",20_000_000,float)
-TG_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
-TG_CHAT=os.getenv("TELEGRAM_CHAT_ID","").strip()
-
-def telegram(msg):
-    if not TG_TOKEN or not TG_CHAT:
-        return
+def pub(path,p=None):
+    r=S.get(BASE+path,params=p or {},timeout=15); r.raise_for_status(); return r.json()
+def signed(method,path,p=None):
+    q=dict(p or {}); q["timestamp"]=int(time.time()*1000); q["recvWindow"]=10000
+    qs=urlencode(q); sig=hmac.new(SECRET.encode(),qs.encode(),hashlib.sha256).hexdigest()
+    r=S.request(method,BASE+path+"?"+qs+"&signature="+sig,timeout=15)
+    if not r.ok: raise RuntimeError(f"{method} {path}: {r.text}")
+    return r.json()
+def balance():
     try:
-        r=requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id":TG_CHAT,"text":msg},
-            timeout=10
-        )
-        if not r.ok:
-            log.error("Telegram %s: %s",r.status_code,r.text[:300])
-    except Exception as e:
-        log.error("Telegram failed: %s",e)
+        for x in signed("GET","/fapi/v2/balance"):
+            if x["asset"]=="USDT": return float(x["balance"])
+    except: pass
+    return 0
+def msg(t,bal=True):
+    if bal:t+=f"\nBalance: ${balance():.2f}"
+    logging.info(t.replace("\n"," | "))
+    if TG and CHAT:
+        try: requests.post(f"https://api.telegram.org/bot{TG}/sendMessage",data={"chat_id":CHAT,"text":t},timeout=8)
+        except: pass
+def floor(x,step):
+    return float((Decimal(str(x))/Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)*Decimal(str(step)))
+def fmt(x): return f"{x:.12f}".rstrip("0").rstrip(".")
+def save():
+    with open(STATE,"w") as f: json.dump({"mine":mine,"pause":pause_until,"loss":loss_window,"losing":losing_cycles,"cycle":cycle_realized},f)
+def load():
+    global mine,pause_until,loss_window,losing_cycles,cycle_realized
+    try:
+        d=json.load(open(STATE)); mine=d.get("mine",{}); pause_until=d.get("pause",0); loss_window=d.get("loss",0); losing_cycles=d.get("losing",0); cycle_realized=d.get("cycle",0)
+    except: pass
 
-class Binance:
-    def __init__(self):
-        if not KEY or not SECRET: raise SystemExit("Missing Binance Demo API keys")
-        self.s=requests.Session(); self.s.headers.update({"X-MBX-APIKEY":KEY,"User-Agent":"AMDPO3Demo/1.1"})
-        self.time_offset=0
-        self.sync_time()
-        self.info=self.get("/fapi/v1/exchangeInfo")
-        self.meta={x["symbol"]:x for x in self.info["symbols"]}
-    def get(self,p,params=None):
-        r=self.s.get(BASE+p,params=params,timeout=20); r.raise_for_status(); return r.json()
-    def signed(self,m,p,params=None):
-        q=dict(params or {}); q["timestamp"]=int(time.time()*1000)+self.time_offset; q.setdefault("recvWindow",10000)
-        raw=urlencode(q,doseq=True); sig=hmac.new(SECRET.encode(),raw.encode(),hashlib.sha256).hexdigest()
-        r=self.s.request(m,BASE+p+"?"+raw+"&signature="+sig,timeout=25)
-        if not r.ok: raise RuntimeError(f"Binance {r.status_code}: {r.text[:500]}")
-        return r.json()
-    def sync_time(self):
-        server=self.get("/fapi/v1/time")["serverTime"]
-        self.time_offset=int(server)-int(time.time()*1000)
-    def positions(self):
-        return [x for x in self.signed("GET","/fapi/v2/positionRisk") if abs(float(x["positionAmt"]))>0]
-    def wallet(self):
-        return float(self.signed("GET","/fapi/v2/account")["totalWalletBalance"])
-    def realized_pnl(self,s,since_ms):
-        rows=self.signed("GET","/fapi/v1/income",{
-            "symbol":s,"incomeType":"REALIZED_PNL","startTime":int(since_ms),"limit":100
-        })
-        return sum(float(x.get("income",0)) for x in rows)
-    def symbols(self):
-        ok={s for s,x in self.meta.items() if x.get("status")=="TRADING" and x.get("quoteAsset")=="USDT" and x.get("contractType")=="PERPETUAL"}
-        rows=self.get("/fapi/v1/ticker/24hr")
-        rows=sorted((x for x in rows if x["symbol"] in ok and float(x.get("quoteVolume",0))>=MIN_VOL),key=lambda x:float(x["quoteVolume"]),reverse=True)
-        return [x["symbol"] for x in rows[:TOP_N]]
-    def candles(self,s):
-        rows=self.get("/fapi/v1/klines",{"symbol":s,"interval":TF,"limit":500})
-        cols=["open_time","open","high","low","close","volume","close_time","qv","n","tb","tq","ignore"]
-        d=pd.DataFrame(rows,columns=cols)
-        for c in ["open","high","low","close","volume"]: d[c]=pd.to_numeric(d[c],errors="coerce")
-        return d.iloc[:-1].reset_index(drop=True)
-    def leverage(self,s):
-        for x in range(LEV,0,-1):
-            try: self.signed("POST","/fapi/v1/leverage",{"symbol":s,"leverage":x}); return x
-            except Exception:
-                if x==1: raise
-    def qty(self,s,q):
-        f={x["filterType"]:x for x in self.meta[s]["filters"]}
-        lot=f.get("MARKET_LOT_SIZE") or f["LOT_SIZE"]; step=float(lot["stepSize"]); mn=float(lot["minQty"])
-        q=max(mn,math.floor(q/step+1e-12)*step)
-        dec=max(0,len(f"{step:.12f}".rstrip("0").split(".")[1]) if "." in f"{step:.12f}".rstrip("0") else 0)
-        return f"{q:.{dec}f}"
-    def order(self,s,side,q,reduce=False):
-        p={"symbol":s,"side":side,"type":"MARKET","quantity":q}
-        if reduce:p["reduceOnly"]="true"
-        return self.signed("POST","/fapi/v1/order",p)
+def exchange_info():
+    global meta
+    for s in pub("/fapi/v1/exchangeInfo")["symbols"]:
+        if s.get("quoteAsset")!="USDT" or s.get("contractType")!="PERPETUAL" or s.get("status")!="TRADING": continue
+        fs={x["filterType"]:x for x in s["filters"]}; lot=fs.get("MARKET_LOT_SIZE",fs.get("LOT_SIZE",{})); pf=fs.get("PRICE_FILTER",{})
+        meta[s["symbol"]]={"step":float(lot.get("stepSize",".001")),"min":float(lot.get("minQty","0")),"tick":float(pf.get("tickSize",".0001"))}
+def positions():
+    return {p["symbol"]:p for p in signed("GET","/fapi/v2/positionRisk") if abs(float(p["positionAmt"]))>0}
+def pos(s):
+    for p in signed("GET","/fapi/v2/positionRisk",{"symbol":s}):
+        if abs(float(p["positionAmt"]))>0:return p
+def market(s,side,qty,reduce=False):
+    p={"symbol":s,"side":side,"type":"MARKET","quantity":fmt(qty),"newOrderRespType":"RESULT"}
+    if reduce:p["reduceOnly"]="true"
+    return signed("POST","/fapi/v1/order",p)
+def cancel_algo(s):
+    try:signed("DELETE","/fapi/v1/algoOpenOrders",{"symbol":s})
+    except:pass
+def stop(s,direction,px):
+    side="SELL" if direction=="LONG" else "BUY"; px=floor(px,meta[s]["tick"])
+    return signed("POST","/fapi/v1/algoOrder",{"algoType":"CONDITIONAL","symbol":s,"side":side,"type":"STOP_MARKET","triggerPrice":fmt(px),"closePosition":"true","workingType":"MARK_PRICE"})
+def leverage(s):
+    for l in [20,15,10,8,5,4,3,2,1]:
+        try:return int(signed("POST","/fapi/v1/leverage",{"symbol":s,"leverage":l})["leverage"])
+        except:continue
+    raise RuntimeError("No leverage available")
+def klines(s):
+    k=pub("/fapi/v1/klines",{"symbol":s,"interval":TF,"limit":110})
+    if k and int(k[-1][6])>=int(time.time()*1000):k=k[:-1]
+    return k
+def sig(s):
+    k=klines(s)
+    if len(k)<99:return "WAIT"
+    c=[float(x[4]) for x in k]; last=c[-1]; m25=sum(c[-25:])/25; m99=sum(c[-99:])/99
+    if last>m99 and last>m25:return "LONG"
+    if last<m99 and last<m25:return "SHORT"
+    return "WAIT"
+def universe():
+    a=[]
+    for t in pub("/fapi/v1/ticker/24hr"):
+        s=t["symbol"]
+        if s in meta and s!="BTCUSDT" and float(t.get("quoteVolume",0))>=MIN_VOL:a.append((s,float(t["quoteVolume"])))
+    return [s for s,_ in sorted(a,key=lambda x:x[1],reverse=True)]
+def roi(p):
+    amt=abs(float(p["positionAmt"])); ep=float(p["entryPrice"]); lev=float(p.get("leverage",20)); pnl=float(p["unRealizedProfit"])
+    margin=amt*ep/max(lev,1); return 100*pnl/margin if margin else 0
+def close(s,p,pct,reason):
+    global loss_window,cycle_realized
+    amt=abs(float(p["positionAmt"])); qty=floor(amt*pct/100,meta[s]["step"])
+    if qty<=0:return
+    est=float(p["unRealizedProfit"])*(qty/amt)
+    market(s,"SELL" if float(p["positionAmt"])>0 else "BUY",qty,True)
+    cycle_realized+=est; loss_window+=est
+    msg(f"{s} {reason}\nPnL approx: ${est:.2f}")
+def enter(s,d):
+    if s in mine:return
+    ps=positions()
+    if len(ps)>=MAX_POS or s in ps:return
+    px=float(pub("/fapi/v1/ticker/price",{"symbol":s})["price"]); lev=leverage(s)
+    qty=floor(NOTIONAL/px,meta[s]["step"])
+    if qty<meta[s]["min"] or qty<=0:return
+    market(s,"BUY" if d=="LONG" else "SELL",qty); time.sleep(.25); p=pos(s)
+    if not p:return
+    ep=float(p["entryPrice"]); adverse=.40/lev
+    sp=ep*(1-adverse) if d=="LONG" else ep*(1+adverse)
+    cancel_algo(s); stop(s,d,sp)
+    mine[s]={"dir":d,"tp1":False}; save()
+    msg(f"OPEN {d} {s}\nNotional: $300 | Leverage: {lev}x\nEntry: {ep}")
+def close_all(reason):
+    global cycle_realized,losing_cycles,pause_until
+    ps=positions(); targets=[(s,p) for s,p in ps.items() if s in mine]
+    cycle_total=cycle_realized+sum(float(p["unRealizedProfit"]) for _,p in targets)
+    for s,p in targets:
+        try: cancel_algo(s); close(s,p,100,reason)
+        except Exception as e: logging.error("%s close: %s",s,e)
+    if cycle_total<0:losing_cycles+=1
+    else:losing_cycles=0
+    if losing_cycles>=3:
+        pause_until=max(pause_until,time.time()+3600); losing_cycles=0; msg("3 losing cycles -> PAUSE 1 HOUR")
+    mine.clear(); cycle_realized=0; save()
+def manage():
+    global pause_until,loss_window
+    ps=positions()
+    for s in list(mine):
+        if s not in ps:
+            mine.pop(s,None); msg(f"{s} CLOSED ON EXCHANGE"); save()
+    total=cycle_realized+sum(float(p["unRealizedProfit"]) for s,p in ps.items() if s in mine)
+    if mine and total>=BASKET:
+        msg(f"BASKET TARGET +${total:.2f} -> CLOSE ALL"); close_all("BASKET +$20"); return
+    for s in list(mine):
+        p=ps.get(s)
+        if not p:continue
+        d="LONG" if float(p["positionAmt"])>0 else "SHORT"
+        if sig(s)!=d:
+            cancel_algo(s); close(s,p,100,"MA EXIT"); mine.pop(s,None); save(); continue
+        r=roi(p)
+        if not mine[s]["tp1"] and r>=100:
+            close(s,p,50,"TP1 +100% / CLOSE 50%"); time.sleep(.2); p2=pos(s)
+            if p2:
+                cancel_algo(s); stop(s,d,float(p2["entryPrice"])); mine[s]["tp1"]=True; save(); msg(f"{s} SL -> BREAKEVEN")
+        elif mine[s]["tp1"] and r>=150:
+            cancel_algo(s); close(s,p,100,"TP2 +150% / CLOSE REST"); mine.pop(s,None); save()
+    if loss_window<=-LOSS_LIMIT and time.time()>=pause_until:
+        pause_until=time.time()+10800; loss_window=0; save(); msg("Loss window reached -$100 -> PAUSE 3 HOURS")
 
-    def price(self,s,p):
-        fs={x["filterType"]:x for x in self.meta[s]["filters"]}
-        tick=float(fs["PRICE_FILTER"]["tickSize"])
-        v=round(float(p)/tick)*tick
-        t=f"{tick:.12f}".rstrip("0")
-        dec=len(t.split(".")[1]) if "." in t else 0
-        return f"{v:.{dec}f}"
-
-    def algo_order(self,p):
-        return self.signed("POST","/fapi/v1/algoOrder",p)
-
-    def protect(self,s,pos_side,stop,target):
-        close_side="SELL" if pos_side=="LONG" else "BUY"
-        common={"algoType":"CONDITIONAL","symbol":s,"side":close_side,
-                "closePosition":"true","workingType":"MARK_PRICE"}
-        sl=dict(common); sl.update({"type":"STOP_MARKET","triggerPrice":self.price(s,stop)})
-        tp=dict(common); tp.update({"type":"TAKE_PROFIT_MARKET","triggerPrice":self.price(s,target)})
-        slr=self.algo_order(sl)
+def scan():
+    global btc_mode
+    new=sig("BTCUSDT")
+    if new!=btc_mode: msg(f"BTC MODE: {btc_mode} -> {new}"); btc_mode=new
+    if time.time()<pause_until or btc_mode=="WAIT":return
+    slots=MAX_POS-len(positions())
+    if slots<=0:return
+    opened=0
+    for s in universe():
+        if opened>=min(slots,5):break
         try:
-            tpr=self.algo_order(tp)
-        except Exception:
-            try:self.cancel_orders(s)
-            except Exception:pass
-            raise
-        return slr,tpr
+            if sig(s)==btc_mode: enter(s,btc_mode); opened+=1
+        except Exception as e: logging.warning("%s: %s",s,e)
 
-    def cancel_orders(self,s):
-        # Standard orders + migrated USD-M conditional/algo orders.
-        for path in ("/fapi/v1/allOpenOrders","/fapi/v1/algoOpenOrders"):
-            try:self.signed("DELETE",path,{"symbol":s})
-            except Exception as e:log.warning("cancel %s %s: %s",s,path,e)
-
-    def close_all(self,attempts=5):
-        for attempt in range(1,attempts+1):
-            ps=self.positions()
-            if not ps:return True
-            for p in ps:
-                s=p["symbol"]; a=float(p["positionAmt"])
-                self.cancel_orders(s)
-                try:self.order(s,"SELL" if a>0 else "BUY",self.qty(s,abs(a)),True)
-                except Exception as e:log.error("close %s attempt %d: %s",s,attempt,e)
-            time.sleep(1)
-        return not self.positions()
-
-def atr(df, n=14):
-    pc = df.close.shift(1)
-    tr = pd.concat([(df.high-df.low), (df.high-pc).abs(), (df.low-pc).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/n, adjust=False).mean()
-
-
-def amd_po3_signal(df):
-    """Confirmed-bar AMD cycle: compression -> sweep -> return -> distribution."""
-    if len(df) < 240:
-        return None
-
-    min_range_bars, max_range_bars = 12, 96
-    range_win, stat_window = 20, 200
-    compression_pct, tolerance = 25.0, 0.10
-    min_width_pct, return_bars = 0.15, 8
-    stop_atr_buffer, fib_extension = 0.40, 1.50
-    distribution_timeout, cooldown_bars = 64, 10
-
-    a14 = atr(df, 14)
-    hi20 = df.high.rolling(range_win).max()
-    lo20 = df.low.rolling(range_win).min()
-    widths = hi20-lo20
-    width_rank = widths.rolling(stat_window).apply(
-        lambda values: 100.0*np.count_nonzero(values <= values[-1])/len(values), raw=True
-    )
-
-    # Pivots are consumed only after three right-hand bars have closed.
-    pivot_lr = 3
-    pivot_high = np.full(len(df), np.nan)
-    pivot_low = np.full(len(df), np.nan)
-    for j in range(pivot_lr, len(df)-pivot_lr):
-        hs = df.high.iloc[j-pivot_lr:j+pivot_lr+1]
-        ls = df.low.iloc[j-pivot_lr:j+pivot_lr+1]
-        if df.high.iat[j] >= hs.max(): pivot_high[j] = df.high.iat[j]
-        if df.low.iat[j] <= ls.min(): pivot_low[j] = df.low.iat[j]
-
-    state, cooldown_until = "IDLE", -1
-    range_start = range_high = range_low = range_width = atr_anchor = None
-    sweep_side = sweep_bar = sweep_extreme = None
-    dist_bar = dist_dir = entry = stop = target = None
-
-    for i in range(stat_window+range_win-2, len(df)):
-        close_i, high_i, low_i = float(df.close.iat[i]), float(df.high.iat[i]), float(df.low.iat[i])
-
-        if state == "IDLE":
-            if i < cooldown_until or pd.isna(width_rank.iat[i]) or width_rank.iat[i] > compression_pct:
-                continue
-            candidate_width = float(widths.iat[i])
-            if candidate_width < min_width_pct/100.0*close_i:
-                continue
-            candidate_start = i-range_win+1
-            confirmed_end = i-pivot_lr
-            ph = pivot_high[candidate_start:confirmed_end+1]
-            pl = pivot_low[candidate_start:confirmed_end+1]
-            range_high = float(np.nanmax(ph)) if np.isfinite(ph).any() else float(hi20.iat[i])
-            range_low = float(np.nanmin(pl)) if np.isfinite(pl).any() else float(lo20.iat[i])
-            range_width = range_high-range_low
-            if range_width < min_width_pct/100.0*close_i:
-                continue
-            range_start = candidate_start
-            anchor_index = max(0, candidate_start-1)
-            atr_anchor = float(a14.iat[anchor_index])
-            if not math.isfinite(atr_anchor) or atr_anchor <= 0:
-                atr_anchor = float(a14.iat[i])
-            state = "ACCUM"
-            continue
-
-        if state == "ACCUM":
-            age = i-range_start
-            if age > max_range_bars:
-                state, cooldown_until = "IDLE", i+cooldown_bars
-                continue
-            tol = tolerance*range_width
-            breach_high = high_i > range_high+tol
-            breach_low = low_i < range_low-tol
-            if age < min_range_bars:
-                if breach_high or breach_low:
-                    state, cooldown_until = "IDLE", i+cooldown_bars
-                continue
-            if breach_high and breach_low:
-                state, cooldown_until = "IDLE", i+cooldown_bars
-                continue
-            if breach_high or breach_low:
-                sweep_side = 1 if breach_high else -1
-                sweep_bar = i
-                sweep_extreme = high_i if breach_high else low_i
-                state = "SWEEP"
-            else:
-                continue
-
-        if state == "SWEEP":
-            sweep_extreme = max(sweep_extreme, high_i) if sweep_side == 1 else min(sweep_extreme, low_i)
-            if i-sweep_bar > return_bars:
-                state, cooldown_until = "IDLE", i+cooldown_bars
-                continue
-            if not (range_low <= close_i <= range_high):
-                continue
-
-            dist_dir = -1 if sweep_side == 1 else 1
-            entry, dist_bar = close_i, i
-            if dist_dir == 1:
-                fib_leg = range_high-sweep_extreme
-                stop = sweep_extreme-stop_atr_buffer*atr_anchor
-                target = range_high+(fib_extension-1.0)*fib_leg
-                side = "LONG"
-            else:
-                fib_leg = sweep_extreme-range_low
-                stop = sweep_extreme+stop_atr_buffer*atr_anchor
-                target = range_low-(fib_extension-1.0)*fib_leg
-                side = "SHORT"
-            if fib_leg <= 0 or not (stop < entry < target if side == "LONG" else target < entry < stop):
-                state, cooldown_until = "IDLE", i+cooldown_bars
-                continue
-            if i == len(df)-1:
-                return {"side":side, "stop":float(stop), "target":float(target), "tag":"AMD_PO3_SWEEP_RETURN"}
-            state = "DIST"
-            continue
-
-        if state == "DIST":
-            hit_target = high_i >= target if dist_dir == 1 else low_i <= target
-            hit_stop = low_i <= stop if dist_dir == 1 else high_i >= stop
-            if hit_target or hit_stop or i-dist_bar >= distribution_timeout:
-                state, cooldown_until = "IDLE", i+cooldown_bars
-
-    return None
-
-
-
-class Bot:
-    def __init__(self):
-        self.b=Binance(); self.last_scan=0; self.seen={}; self.day=None; self.day_wallet=None
-        self.tracked={}
-        now=int(time.time()*1000)
-        for p in self.b.positions():
-            a=float(p["positionAmt"])
-            self.tracked[p["symbol"]]={"side":"LONG" if a>0 else "SHORT","opened_ms":now}
-    def daily_ok(self):
-        d=time.strftime("%Y-%m-%d",time.gmtime())
-        if d!=self.day: self.day=d; self.day_wallet=self.b.wallet()
-        return self.b.wallet()-self.day_wallet > -DAILY_STOP
-    def track_exchange_closes(self,ps):
-        current={p["symbol"] for p in ps}
-        for s,meta in list(self.tracked.items()):
-            if s in current:
-                continue
-            try:
-                pnl=self.b.realized_pnl(s,meta["opened_ms"])
-                reason="TAKE PROFIT" if pnl>0 else ("STOP LOSS" if pnl<0 else "EXCHANGE CLOSE")
-                msg=f"CLOSED {s} {meta['side']} | {reason} | Realized PnL: ${pnl:+.2f}"
-                log.warning(msg)
-                telegram("AMD DEMO\n"+msg)
-            except Exception as e:
-                log.error("CLOSE TRACK %s failed: %s",s,e)
-                telegram(f"AMD DEMO\nCLOSED {s} {meta['side']}\nPnL lookup failed: {e}")
-            finally:
-                self.tracked.pop(s,None)
-
-    def risk(self):
-        ps=self.b.positions()
-        self.track_exchange_closes(ps)
-        pnl=sum(float(p.get("unRealizedProfit",0)) for p in ps)
-        log.info("BASKET open_pnl=%+.2f target=%.2f positions=%d",pnl,BASKET,len(ps))
-        if ps and pnl>=BASKET:
-            log.warning("BASKET TARGET HIT %+.2f -> CLOSE ALL 100%%",pnl)
-            telegram(f"AMD DEMO\nBASKET HIT ${pnl:+.2f}\nClosing all positions 100%")
-            for p in ps:
-                self.tracked.pop(p["symbol"],None)
-            ok=self.b.close_all()
-            rem=self.b.positions()
-            if rem:
-                log.error("CLOSE ALL incomplete: %d remain",len(rem))
-                telegram(f"AMD DEMO ERROR\nClose-all incomplete: {len(rem)} remain")
-            else:
-                log.warning("CYCLE COMPLETE -> immediate new cycle")
-                telegram("AMD DEMO\nCYCLE COMPLETE\nAll positions closed. Fresh scan starts now.")
-                # New basket cycle: old candle de-duplication must not block
-                # currently valid AMD signals from being reconsidered.
-                self.seen.clear()
-                self.last_scan=0
-                # Permit run() to scan in this same loop, while still respecting daily stop.
-                return self.daily_ok()
-            return False
-        if not self.daily_ok():
-            if ps:self.b.close_all()
-            log.warning("DAILY STOP ACTIVE")
-            return False
-        return True
-    def scan(self):
-        ps=self.b.positions(); held={p["symbol"] for p in ps}
-        if len(held)>=MAX_POS:return
-        for s in self.b.symbols():
-            if s in held:continue
-            try:
-                d=self.b.candles(s); sig=amd_po3_signal(d)
-                if not sig:continue
-                cid=str(int(d.open_time.iat[-1])); k=f"{s}:{sig['side']}:{sig['tag']}"
-                if self.seen.get(k)==cid:continue
-                self.seen[k]=cid; price=float(d.close.iat[-1]); lev=self.b.leverage(s)
-                q=self.b.qty(s,NOTIONAL/price)
-                self.b.order(s,"BUY" if sig["side"]=="LONG" else "SELL",q)
-                try:
-                    self.b.protect(s,sig["side"],sig["stop"],sig["target"])
-                    self.tracked[s]={"side":sig["side"],"opened_ms":int(time.time()*1000)}
-                except Exception as e:
-                    log.exception("PROTECTION FAILED %s -> emergency close",s)
-                    telegram(f"AMD DEMO ERROR\n{s} opened but SL/TP failed. Emergency closing.\n{e}")
-                    time.sleep(0.3)
-                    for p in self.b.positions():
-                        if p["symbol"]==s:
-                            a=float(p["positionAmt"])
-                            self.b.order(s,"SELL" if a>0 else "BUY",self.b.qty(s,abs(a)),True)
-                    self.b.cancel_orders(s)
-                    continue
-                slp=self.b.price(s,sig["stop"]); tpp=self.b.price(s,sig["target"])
-                log.warning("OPEN %s %s notional~%.2f leverage=%dx SL=%s TP=%s",s,sig["side"],NOTIONAL,lev,slp,tpp)
-                telegram(f"AMD DEMO OPEN\n{s} {sig['side']}\nNotional: ${NOTIONAL:.2f}\nLeverage: {lev}x\nEntry approx: {price}\nSL: {slp}\nTP: {tpp}")
-                held.add(s)
-                if len(held)>=MAX_POS:break
-            except Exception as e:log.exception("%s failed: %s",s,e)
-    def run(self):
-        log.warning("START AMD PO3 BINANCE DEMO | basket +$%.2f | max %d | $%.2f each",BASKET,MAX_POS,NOTIONAL)
-        telegram(f"AMD PO3 DEMO STARTED\nMax positions: {MAX_POS}\nNotional: ${NOTIONAL:.2f}\nLeverage target: {LEV}x\nBasket: +${BASKET:.2f}\nDaily stop: -${DAILY_STOP:.2f}")
-        while True:
-            try:
-                if self.risk() and time.time()-self.last_scan>=SCAN:
-                    self.scan(); self.last_scan=time.time()
-            except Exception:log.exception("MAIN LOOP")
-            time.sleep(CHECK)
-
-if __name__=="__main__": Bot().run()
+def main():
+    if not KEY or not SECRET:raise RuntimeError("Missing Binance demo API keys")
+    exchange_info(); load()
+    # Never adopt unknown positions: safe for other bots on same account.
+    ps=positions()
+    for s in list(mine):
+        if s not in ps:mine.pop(s,None)
+    msg(f"MA BTC Sync Bot STARTED\n15m SMA 7/25/99 | $300 | max 20 | Basket +$20\nLiquidity floor: ${MIN_VOL:,.0f}/24h")
+    last=0
+    while True:
+        try:
+            manage()
+            if time.time()-last>=20:scan();last=time.time()
+            time.sleep(5)
+        except Exception as e:
+            logging.exception(e);time.sleep(5)
+if __name__=="__main__":main()
