@@ -8,6 +8,7 @@ BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
+EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
 BASKET=20.0; LOSS_LIMIT=100.0
 S=requests.Session(); S.headers.update({"X-MBX-APIKEY":KEY})
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
@@ -63,9 +64,31 @@ def market(s,side,qty,reduce=False):
 def cancel_algo(s):
     try:signed("DELETE","/fapi/v1/algoOpenOrders",{"symbol":s})
     except:pass
-def stop(s,direction,px):
+def algo_close(s,direction,order_type,px,qty=None,close_position=False):
     side="SELL" if direction=="LONG" else "BUY"; px=floor(px,meta[s]["tick"])
-    return signed("POST","/fapi/v1/algoOrder",{"algoType":"CONDITIONAL","symbol":s,"side":side,"type":"STOP_MARKET","triggerPrice":fmt(px),"closePosition":"true","workingType":"MARK_PRICE"})
+    q={"algoType":"CONDITIONAL","symbol":s,"side":side,"type":order_type,
+       "triggerPrice":fmt(px),"workingType":"MARK_PRICE","reduceOnly":"true"}
+    if close_position:
+        q.pop("reduceOnly",None); q["closePosition"]="true"
+    elif qty is not None:
+        q["quantity"]=fmt(qty)
+    return signed("POST","/fapi/v1/algoOrder",q)
+
+def stop(s,direction,px):
+    return algo_close(s,direction,"STOP_MARKET",px,close_position=True)
+
+def place_targets(s,direction,entry_px,lev,full_qty):
+    # ROI targets converted to price moves using the actual leverage.
+    step=meta[s]["step"]
+    half=floor(full_qty*0.5,step)
+    rest=floor(full_qty-half,step)
+    tp1_move=1.00/lev
+    tp2_move=1.50/lev
+    tp1=entry_px*(1+tp1_move) if direction=="LONG" else entry_px*(1-tp1_move)
+    tp2=entry_px*(1+tp2_move) if direction=="LONG" else entry_px*(1-tp2_move)
+    if half>0: algo_close(s,direction,"TAKE_PROFIT_MARKET",tp1,qty=half)
+    if rest>0: algo_close(s,direction,"TAKE_PROFIT_MARKET",tp2,qty=rest)
+    return tp1,tp2
 def leverage(s):
     for l in [20,15,10,8,5,4,3,2,1]:
         try:return int(signed("POST","/fapi/v1/leverage",{"symbol":s,"leverage":l})["leverage"])
@@ -86,7 +109,7 @@ def universe():
     a=[]
     for t in pub("/fapi/v1/ticker/24hr"):
         s=t["symbol"]
-        if s in meta and s!="BTCUSDT" and float(t.get("quoteVolume",0))>=MIN_VOL:a.append((s,float(t["quoteVolume"])))
+        if s in meta and s!="BTCUSDT" and s not in EXCLUDED and float(t.get("quoteVolume",0))>=MIN_VOL:a.append((s,float(t["quoteVolume"])))
     return [s for s,_ in sorted(a,key=lambda x:x[1],reverse=True)]
 def roi(p):
     amt=abs(float(p["positionAmt"])); ep=float(p["entryPrice"]); lev=float(p.get("leverage",20)); pnl=float(p["unRealizedProfit"])
@@ -110,9 +133,11 @@ def enter(s,d):
     if not p:return
     ep=float(p["entryPrice"]); adverse=.40/lev
     sp=ep*(1-adverse) if d=="LONG" else ep*(1+adverse)
-    cancel_algo(s); stop(s,d,sp)
-    mine[s]={"dir":d,"tp1":False}; save()
-    msg(f"OPEN {d} {s}\nNotional: $300 | Leverage: {lev}x\nEntry: {ep}")
+    cancel_algo(s)
+    stop(s,d,sp)
+    tp1_px,tp2_px=place_targets(s,d,ep,lev,abs(float(p["positionAmt"])))
+    mine[s]={"dir":d,"tp1":False,"tp1_px":tp1_px,"tp2_px":tp2_px,"initial_qty":abs(float(p["positionAmt"]))}; save()
+    msg(f"OPEN {d} {s}\nNotional: $300 | Leverage: {lev}x\nEntry: {ep}\nTP1: {tp1_px} (50%) | TP2: {tp2_px} (50%)")
 def close_all(reason):
     global cycle_realized,losing_cycles,pause_until
     ps=positions(); targets=[(s,p) for s,p in ps.items() if s in mine]
@@ -140,13 +165,21 @@ def manage():
         d="LONG" if float(p["positionAmt"])>0 else "SHORT"
         if sig(s)!=d:
             cancel_algo(s); close(s,p,100,"MA EXIT"); mine.pop(s,None); save(); continue
-        r=roi(p)
-        if not mine[s]["tp1"] and r>=100:
-            close(s,p,50,"TP1 +100% / CLOSE 50%"); time.sleep(.2); p2=pos(s)
-            if p2:
-                cancel_algo(s); stop(s,d,float(p2["entryPrice"])); mine[s]["tp1"]=True; save(); msg(f"{s} SL -> BREAKEVEN")
-        elif mine[s]["tp1"] and r>=150:
-            cancel_algo(s); close(s,p,100,"TP2 +150% / CLOSE REST"); mine.pop(s,None); save()
+        # TP1/TP2 are exchange-side. Detect TP1 by the position shrinking to about half.
+        current_qty=abs(float(p["positionAmt"]))
+        initial_qty=float(mine[s].get("initial_qty",current_qty))
+        if not mine[s]["tp1"] and initial_qty>0 and current_qty <= initial_qty*0.55:
+            # TP1 executed on Binance. Rebuild protection for the remaining half:
+            # SL at breakeven + TP2 for remaining quantity.
+            cancel_algo(s)
+            ep=float(p["entryPrice"])
+            stop(s,d,ep)
+            lev=float(p.get("leverage",20))
+            tp2_move=1.50/max(lev,1)
+            tp2=ep*(1+tp2_move) if d=="LONG" else ep*(1-tp2_move)
+            algo_close(s,d,"TAKE_PROFIT_MARKET",tp2,qty=current_qty)
+            mine[s]["tp1"]=True; save()
+            msg(f"{s} TP1 EXECUTED (50%)\nSL moved to BREAKEVEN\nTP2 remains at +150% ROI")
     if loss_window<=-LOSS_LIMIT and time.time()>=pause_until:
         pause_until=time.time()+10800; loss_window=0; save(); msg("Loss window reached -$100 -> PAUSE 3 HOURS")
 
@@ -159,7 +192,7 @@ def scan():
     if slots<=0:return
     opened=0
     for s in universe():
-        if opened>=min(slots,5):break
+        if opened>=slots:break
         try:
             if sig(s)==btc_mode: enter(s,btc_mode); opened+=1
         except Exception as e: logging.warning("%s: %s",s,e)
