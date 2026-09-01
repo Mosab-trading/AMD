@@ -7,7 +7,7 @@ import pandas as pd
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V1.4-BTC-LIQUIDITY"
+BOT_VERSION="V1.4.1-BTC-LIQUIDITY-FIX"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -115,6 +115,11 @@ def klines(s):
     k=pub("/fapi/v1/klines",{"symbol":s,"interval":TF,"limit":110})
     if k and int(k[-1][6])>=int(time.time()*1000):k=k[:-1]
     return k
+def sma(values, period):
+    if not values or len(values) < period:
+        return 0.0
+    return sum(values[-period:]) / period
+
 def sig(s, entry_filter=False):
     k=klines(s)
     if not k or len(k)<101:return "WAIT"
