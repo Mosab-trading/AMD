@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V1.6.4.1-BASKET-MA25-REARM-FIX"
+BOT_VERSION="V1.6.4.3-MA25-EXIT-MA99-ENTRY"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -432,8 +432,12 @@ def scan():
     if new!=btc_mode:
         old_mode=btc_mode
         msg(f"BTC MODE: {old_mode} -> {new}")
+        # BTC cycle management only:
+        # SHORT -> close all when a CLOSED BTC candle crosses/closes above MA25.
+        # LONG  -> close all when a CLOSED BTC candle crosses/closes below MA25.
+        # Opposite entries still require a close beyond BOTH MA25 and MA99 via sig().
         if mine and old_mode in ("LONG","SHORT") and new!=old_mode:
-            if not close_all(f"BTC MODE {old_mode}->{new}"):
+            if not close_all(f"BTC MA25 EXIT {old_mode}->{new}"):
                 return
         btc_mode=new
         save()
@@ -451,6 +455,20 @@ def scan():
         return
 
     closed_candle=snap["candle"]
+
+    # A basket re-arm lock belongs ONLY to the direction of the completed basket.
+    # Example: SHORT basket closed +$50 -> block another SHORT cycle until MA25 retest.
+    # But if BTC later closes above BOTH MA25 and MA99, that is a NEW LONG regime:
+    # discard the stale SHORT re-arm lock and allow LONG immediately.
+    if basket_rearm_dir and btc_mode in ("LONG","SHORT") and btc_mode!=basket_rearm_dir:
+        old_rearm=basket_rearm_dir
+        basket_rearm_dir=""
+        basket_rearm_touched=False
+        basket_lock_candle=0
+        entry_candle=0
+        entries_this_candle=0
+        save()
+        msg(f"BTC NEW {btc_mode} REGIME | cleared old {old_rearm} basket re-arm lock")
 
     # +$50 basket re-arm rule:
     # SHORT: while below MA25, no new cycle until BTC retests MA25.
