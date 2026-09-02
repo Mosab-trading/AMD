@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V1.6-2-PER-CANDLE-BASKET50"
+BOT_VERSION="V1.6.1-2-PER-CANDLE-BASKET50-FIX"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -348,6 +348,13 @@ def liquidity_entry_signal(s):
         logging.warning("%s liquidity signal: %s",s,e)
         return None
 
+def open_position_count():
+    try:
+        return sum(1 for p in signed("GET","/fapi/v2/positionRisk") if abs(float(p.get("positionAmt",0)))>0)
+    except Exception as e:
+        logging.warning("open position count failed: %s",e)
+        return len(mine)
+
 def scan():
     global btc_mode,last_entry_candle
     new=sig("BTCUSDT")
@@ -376,7 +383,7 @@ def scan():
     last_entry_candle=closed_candle
     save()
 
-    slots=max(0,MAX_POS-len(pos()))
+    slots=max(0,MAX_POS-open_position_count())
     batch_limit=min(2,slots)
     if batch_limit<=0:
         return
@@ -396,7 +403,7 @@ def scan():
                 logging.warning("%s entry failed: %s",s,e)
 
     logging.info("BTC CLOSED CANDLE %s | %s | NEW %s/%s | OPEN %s/%s",
-                 closed_candle,btc_mode,opened,batch_limit,len(pos()),MAX_POS)
+                 closed_candle,btc_mode,opened,batch_limit,open_position_count(),MAX_POS)
 
 def main():
     if not KEY or not SECRET:raise RuntimeError("Missing Binance demo API keys")
@@ -405,7 +412,7 @@ def main():
     ps=positions()
     for s in list(mine):
         if s not in ps:mine.pop(s,None)
-    msg(f"MA BTC Sync Bot {BOT_VERSION} STARTED\n15m SMA 7/25/99 | Allocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket: NET +$20 AFTER CLOSE FEES | BTC MA25/99 = direction/exit gate | Liquidity Reversal Staged TRAP/PO3+RSI = coin selection/entry | SL50 TP100/150/200\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
+    msg(f"MA BTC Sync Bot {BOT_VERSION} STARTED\n15m SMA 7/25/99 | Allocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket: NET +$50 AFTER CLOSE FEES | BTC MA25/99 = direction/exit gate | Liquidity Reversal Staged TRAP/PO3+RSI = coin selection/entry | SL50 TP100/150/200\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
     last=0
     while True:
         try:
