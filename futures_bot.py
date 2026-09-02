@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V1.6.2-CANDLE-ENTRY-FIX-BASKET50"
+BOT_VERSION="V1.6.3-REAL-PNL-BALANCE"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -34,8 +34,44 @@ def balance():
             if x["asset"]=="USDT": return float(x["balance"])
     except: pass
     return 0
+def trade_rows(s,start_ms=0):
+    p={"symbol":s,"limit":1000}
+    if start_ms:p["startTime"]=int(start_ms)
+    return signed("GET","/fapi/v1/userTrades",p)
+
+def sync_realized():
+    """Book ACTUAL Binance realizedPnl and commissions for this bot's trades."""
+    global bot_realized,cycle_realized,loss_window
+    changed=False
+    for s,st in list(mine.items()):
+        try:
+            seen=set(str(x) for x in st.get("accounted_trade_ids",[]))
+            rows=trade_rows(s,st.get("entry_time",0))
+            for tr in rows:
+                tid=str(tr.get("id"))
+                if tid in seen:continue
+                # Binance userTrades: realizedPnl is exact realized profit/loss;
+                # commission is an actual cost and must be deducted.
+                delta=float(tr.get("realizedPnl",0))-float(tr.get("commission",0))
+                bot_realized+=delta
+                cycle_realized+=delta
+                loss_window+=delta
+                seen.add(tid); changed=True
+            st["accounted_trade_ids"]=list(seen)[-2000:]
+        except Exception as e:
+            logging.warning("%s PnL sync failed: %s",s,e)
+    if changed:save()
+
+def live_unrealized():
+    try:
+        ps=positions()
+        return sum(float(p.get("unRealizedProfit",0)) for s,p in ps.items() if s in mine)
+    except:
+        return 0.0
+
 def bot_balance():
-    return ALLOCATED_CAPITAL + bot_realized
+    # Virtual $500 allocation + ACTUAL realized bot PnL + current open PnL.
+    return ALLOCATED_CAPITAL + bot_realized + live_unrealized()
 
 def msg(t,bal=True):
     if bal:t+=f"\nBot Balance: ${bot_balance():.2f}"
@@ -163,13 +199,10 @@ def close(s,p,pct,reason):
     global loss_window,cycle_realized,bot_realized
     amt=abs(float(p["positionAmt"])); qty=qty_ok(s,amt*pct/100)
     if qty<=0:return
-    est=float(p["unRealizedProfit"])*(qty/amt)
-    mark=float(p.get("markPrice") or p["entryPrice"])
-    exit_fee=qty*mark*TAKER_FEE_RATE
-    net_est=est-exit_fee
     market(s,"SELL" if float(p["positionAmt"])>0 else "BUY",qty,True)
-    cycle_realized+=net_est; loss_window+=net_est; bot_realized+=net_est
-    msg(f"{s} {reason}\nNet PnL approx: ${net_est:.2f}")
+    time.sleep(.35)
+    sync_realized()
+    msg(f"{s} {reason}\nPnL booked from Binance trade history")
 def enter(s,d):
     if s in mine:return
     ps=positions()
@@ -184,7 +217,10 @@ def enter(s,d):
     cancel_algo(s)
     stop(s,d,sp)
     tp1_px,tp2_px,tp3_px=place_targets(s,d,ep,lev,abs(float(p["positionAmt"])))
-    mine[s]={"dir":d,"tp1":False,"tp2":False,"tp1_px":tp1_px,"tp2_px":tp2_px,"tp3_px":tp3_px,"initial_qty":abs(float(p["positionAmt"]))}; save()
+    mine[s]={"dir":d,"tp1":False,"tp2":False,"tp1_px":tp1_px,"tp2_px":tp2_px,"tp3_px":tp3_px,
+             "initial_qty":abs(float(p["positionAmt"])),"entry_time":int(time.time()*1000)-10000,
+             "accounted_trade_ids":[]}; save()
+    sync_realized()
     msg(f"OPEN {d} {s}\nNotional: $300 | Leverage: {lev}x\nEntry: {ep}\nSL: -50% ROI | TP1: +100% (50%) | TP2: +150% (25%) | TP3: +200% (25%)")
 def close_all(reason):
     global cycle_realized,losing_cycles,pause_until,basket_lock_candle
@@ -244,16 +280,22 @@ def close_all(reason):
 
 def manage():
     global pause_until,loss_window
+    # First reconcile actual fills (TP/SL/partial/manual basket) including commissions.
+    sync_realized()
     ps=positions()
     for s in list(mine):
         if s not in ps:
-            mine.pop(s,None); msg(f"{s} CLOSED ON EXCHANGE"); save()
+            # One final reconciliation before forgetting the symbol.
+            sync_realized()
+            final_bal=bot_balance()
+            mine.pop(s,None); save()
+            msg(f"{s} CLOSED ON EXCHANGE | Actual PnL reconciled")
     gross_total=cycle_realized+sum(float(p["unRealizedProfit"]) for s,p in ps.items() if s in mine)
     expected_close_fees=estimated_exit_fees(ps)
     net_after_close=gross_total-expected_close_fees
     if mine and net_after_close>=BASKET:
         msg(f"BASKET NET TARGET ${net_after_close:.2f} AFTER EST. CLOSE FEES -> CLOSE ALL")
-        close_all("BASKET NET +$20")
+        close_all("BASKET NET +$50")
         return
     for s in list(mine):
         p=ps.get(s)
