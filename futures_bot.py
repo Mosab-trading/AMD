@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V1.6.4-BASKET-MA25-REARM"
+BOT_VERSION="V1.6.4.1-BASKET-MA25-REARM-FIX"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -420,7 +420,7 @@ def open_position_count():
         return len(mine)
 
 def scan():
-    global btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched
+    global btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched,basket_lock_candle
     snap=btc_ma_snapshot()
     if not snap:
         return
