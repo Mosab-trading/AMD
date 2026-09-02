@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V1.6.1-2-PER-CANDLE-BASKET50-FIX"
+BOT_VERSION="V1.6.2-CANDLE-ENTRY-FIX-BASKET50"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -17,7 +17,7 @@ ALLOCATED_CAPITAL=float(os.getenv("ALLOCATED_CAPITAL","500"))
 TAKER_FEE_RATE=float(os.getenv("TAKER_FEE_RATE","0.0005"))
 S=requests.Session(); S.headers.update({"X-MBX-APIKEY":KEY})
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
-meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0; bot_realized=0; basket_lock_candle=0; last_entry_candle=0
+meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0; bot_realized=0; basket_lock_candle=0; entry_candle=0; entries_this_candle=0
 STATE="state.json"
 
 def pub(path,p=None):
@@ -52,11 +52,11 @@ def qty_ok(s,x):
     q=float(f"{q:.{prec}f}")
     return q
 def save():
-    with open(STATE,"w") as f: json.dump({"mine":mine,"pause":pause_until,"loss":loss_window,"losing":losing_cycles,"cycle":cycle_realized,"bot_realized":bot_realized,"basket_lock_candle":basket_lock_candle,"btc_mode":btc_mode,"last_entry_candle":last_entry_candle},f)
+    with open(STATE,"w") as f: json.dump({"mine":mine,"pause":pause_until,"loss":loss_window,"losing":losing_cycles,"cycle":cycle_realized,"bot_realized":bot_realized,"basket_lock_candle":basket_lock_candle,"btc_mode":btc_mode,"entry_candle":entry_candle,"entries_this_candle":entries_this_candle},f)
 def load():
-    global mine,pause_until,loss_window,losing_cycles,cycle_realized,bot_realized,basket_lock_candle,btc_mode,last_entry_candle
+    global mine,pause_until,loss_window,losing_cycles,cycle_realized,bot_realized,basket_lock_candle,btc_mode,entry_candle,entries_this_candle
     try:
-        d=json.load(open(STATE)); mine=d.get("mine",{}); pause_until=d.get("pause",0); loss_window=d.get("loss",0); losing_cycles=d.get("losing",0); cycle_realized=d.get("cycle",0); bot_realized=d.get("bot_realized",0); basket_lock_candle=d.get("basket_lock_candle",0); btc_mode=d.get("btc_mode","WAIT"); last_entry_candle=d.get("last_entry_candle",0)
+        d=json.load(open(STATE)); mine=d.get("mine",{}); pause_until=d.get("pause",0); loss_window=d.get("loss",0); losing_cycles=d.get("losing",0); cycle_realized=d.get("cycle",0); bot_realized=d.get("bot_realized",0); basket_lock_candle=d.get("basket_lock_candle",0); btc_mode=d.get("btc_mode","WAIT"); entry_candle=d.get("entry_candle",0); entries_this_candle=d.get("entries_this_candle",0)
     except: pass
 
 def exchange_info():
@@ -356,8 +356,12 @@ def open_position_count():
         return len(mine)
 
 def scan():
-    global btc_mode,last_entry_candle
+    global btc_mode,entry_candle,entries_this_candle
     new=sig("BTCUSDT")
+
+    # Always show the current BTC gate in the log, even when it did not change.
+    logging.info("BTC GATE: %s | closed 15m candle",new)
+
     if new!=btc_mode:
         old_mode=btc_mode
         msg(f"BTC MODE: {old_mode} -> {new}")
@@ -366,6 +370,7 @@ def scan():
                 return
         btc_mode=new
         save()
+
     if time.time()<pause_until or btc_mode=="WAIT":
         return
 
@@ -376,15 +381,20 @@ def scan():
 
     if basket_lock_candle and closed_candle<=basket_lock_candle:
         return
-    if closed_candle==last_entry_candle:
+
+    # New BTC candle => reset only the per-candle entry counter.
+    if closed_candle!=entry_candle:
+        entry_candle=closed_candle
+        entries_this_candle=0
+        save()
+
+    # Keep scanning during the same candle. Stop only after TWO actual entries.
+    remaining_for_candle=max(0,2-entries_this_candle)
+    if remaining_for_candle<=0:
         return
 
-    # Exactly one entry batch for each newly CLOSED 15m BTC candle.
-    last_entry_candle=closed_candle
-    save()
-
     slots=max(0,MAX_POS-open_position_count())
-    batch_limit=min(2,slots)
+    batch_limit=min(remaining_for_candle,slots)
     if batch_limit<=0:
         return
 
@@ -399,11 +409,13 @@ def scan():
             try:
                 enter(s,btc_mode)
                 opened+=1
+                entries_this_candle+=1
+                save()
             except Exception as e:
                 logging.warning("%s entry failed: %s",s,e)
 
-    logging.info("BTC CLOSED CANDLE %s | %s | NEW %s/%s | OPEN %s/%s",
-                 closed_candle,btc_mode,opened,batch_limit,open_position_count(),MAX_POS)
+    logging.info("BTC CANDLE %s | GATE %s | OPENED %s | CANDLE TOTAL %s/2 | OPEN %s/%s",
+                 closed_candle,btc_mode,opened,entries_this_candle,open_position_count(),MAX_POS)
 
 def main():
     if not KEY or not SECRET:raise RuntimeError("Missing Binance demo API keys")
