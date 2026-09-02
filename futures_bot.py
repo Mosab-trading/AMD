@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V1.6.3-REAL-PNL-BALANCE"
+BOT_VERSION="V1.6.4-BASKET-MA25-REARM"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -17,7 +17,7 @@ ALLOCATED_CAPITAL=float(os.getenv("ALLOCATED_CAPITAL","500"))
 TAKER_FEE_RATE=float(os.getenv("TAKER_FEE_RATE","0.0005"))
 S=requests.Session(); S.headers.update({"X-MBX-APIKEY":KEY})
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
-meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0; bot_realized=0; basket_lock_candle=0; entry_candle=0; entries_this_candle=0
+meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0; bot_realized=0; basket_lock_candle=0; entry_candle=0; entries_this_candle=0; basket_rearm_dir=""; basket_rearm_touched=False
 STATE="state.json"
 
 def pub(path,p=None):
@@ -88,11 +88,11 @@ def qty_ok(s,x):
     q=float(f"{q:.{prec}f}")
     return q
 def save():
-    with open(STATE,"w") as f: json.dump({"mine":mine,"pause":pause_until,"loss":loss_window,"losing":losing_cycles,"cycle":cycle_realized,"bot_realized":bot_realized,"basket_lock_candle":basket_lock_candle,"btc_mode":btc_mode,"entry_candle":entry_candle,"entries_this_candle":entries_this_candle},f)
+    with open(STATE,"w") as f: json.dump({"mine":mine,"pause":pause_until,"loss":loss_window,"losing":losing_cycles,"cycle":cycle_realized,"bot_realized":bot_realized,"basket_lock_candle":basket_lock_candle,"btc_mode":btc_mode,"entry_candle":entry_candle,"entries_this_candle":entries_this_candle,"basket_rearm_dir":basket_rearm_dir,"basket_rearm_touched":basket_rearm_touched},f)
 def load():
-    global mine,pause_until,loss_window,losing_cycles,cycle_realized,bot_realized,basket_lock_candle,btc_mode,entry_candle,entries_this_candle
+    global mine,pause_until,loss_window,losing_cycles,cycle_realized,bot_realized,basket_lock_candle,btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched
     try:
-        d=json.load(open(STATE)); mine=d.get("mine",{}); pause_until=d.get("pause",0); loss_window=d.get("loss",0); losing_cycles=d.get("losing",0); cycle_realized=d.get("cycle",0); bot_realized=d.get("bot_realized",0); basket_lock_candle=d.get("basket_lock_candle",0); btc_mode=d.get("btc_mode","WAIT"); entry_candle=d.get("entry_candle",0); entries_this_candle=d.get("entries_this_candle",0)
+        d=json.load(open(STATE)); mine=d.get("mine",{}); pause_until=d.get("pause",0); loss_window=d.get("loss",0); losing_cycles=d.get("losing",0); cycle_realized=d.get("cycle",0); bot_realized=d.get("bot_realized",0); basket_lock_candle=d.get("basket_lock_candle",0); btc_mode=d.get("btc_mode","WAIT"); entry_candle=d.get("entry_candle",0); entries_this_candle=d.get("entries_this_candle",0); basket_rearm_dir=d.get("basket_rearm_dir",""); basket_rearm_touched=d.get("basket_rearm_touched",False)
     except: pass
 
 def exchange_info():
@@ -172,6 +172,21 @@ def sig(s):
     if last<m99 and last<m25:return "SHORT"
     return "WAIT"
 
+def btc_ma_snapshot():
+    """Last CLOSED BTC 15m candle + SMA25/SMA99."""
+    k=klines("BTCUSDT")
+    if not k or len(k)<99:return None
+    closes=[float(x[4]) for x in k]
+    row=k[-1]
+    return {
+        "candle":int(row[0]),
+        "high":float(row[2]),
+        "low":float(row[3]),
+        "close":float(row[4]),
+        "ma25":sum(closes[-25:])/25,
+        "ma99":sum(closes[-99:])/99,
+    }
+
 def universe():
     a=[]
     for t in pub("/fapi/v1/ticker/24hr"):
@@ -223,7 +238,7 @@ def enter(s,d):
     sync_realized()
     msg(f"OPEN {d} {s}\nNotional: $300 | Leverage: {lev}x\nEntry: {ep}\nSL: -50% ROI | TP1: +100% (50%) | TP2: +150% (25%) | TP3: +200% (25%)")
 def close_all(reason):
-    global cycle_realized,losing_cycles,pause_until,basket_lock_candle
+    global cycle_realized,losing_cycles,pause_until,basket_lock_candle,basket_rearm_dir,basket_rearm_touched
     ps=positions(); targets=[(s,p) for s,p in ps.items() if s in mine]
     cycle_total=cycle_realized+sum(float(p["unRealizedProfit"]) for _,p in targets)
 
@@ -275,6 +290,13 @@ def close_all(reason):
 
     mine.clear(); cycle_realized=0
     basket_lock_candle=closed_candle_id("BTCUSDT")
+
+    # After a profitable +$50 basket, do NOT start another cycle while BTC
+    # simply continues on the same side of MA25. It must first RETEST MA25.
+    if reason=="BASKET NET +$50":
+        basket_rearm_dir=btc_mode if btc_mode in ("LONG","SHORT") else ""
+        basket_rearm_touched=False
+        msg(f"BASKET +$50 CLOSED | RE-ARM LOCK {basket_rearm_dir}: waiting for BTC MA25 retest")
     save()
     return True
 
@@ -398,11 +420,14 @@ def open_position_count():
         return len(mine)
 
 def scan():
-    global btc_mode,entry_candle,entries_this_candle
-    new=sig("BTCUSDT")
+    global btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched
+    snap=btc_ma_snapshot()
+    if not snap:
+        return
 
-    # Always show the current BTC gate in the log, even when it did not change.
-    logging.info("BTC GATE: %s | closed 15m candle",new)
+    new=sig("BTCUSDT")
+    logging.info("BTC GATE: %s | close %.8g | MA25 %.8g | MA99 %.8g | closed 15m candle",
+                 new,snap["close"],snap["ma25"],snap["ma99"])
 
     if new!=btc_mode:
         old_mode=btc_mode
@@ -414,23 +439,56 @@ def scan():
         save()
 
     if time.time()<pause_until or btc_mode=="WAIT":
+        # A close across MA25 counts as a completed retest for the locked direction.
+        if basket_rearm_dir=="SHORT" and snap["close"]>=snap["ma25"]:
+            if not basket_rearm_touched:
+                basket_rearm_touched=True; save()
+                msg("SHORT RE-ARM: BTC reached/closed at or above MA25; waiting for a CLOSED candle back below MA25")
+        elif basket_rearm_dir=="LONG" and snap["close"]<=snap["ma25"]:
+            if not basket_rearm_touched:
+                basket_rearm_touched=True; save()
+                msg("LONG RE-ARM: BTC reached/closed at or below MA25; waiting for a CLOSED candle back above MA25")
         return
 
-    btc_rows=klines("BTCUSDT")
-    if not btc_rows:
-        return
-    closed_candle=int(btc_rows[-1][0])
+    closed_candle=snap["candle"]
+
+    # +$50 basket re-arm rule:
+    # SHORT: while below MA25, no new cycle until BTC retests MA25.
+    #        Direct wick touch + close below unlocks immediately.
+    #        Or close above MA25, then a later close below unlocks.
+    # LONG is the exact mirror.
+    if basket_rearm_dir:
+        if basket_rearm_dir=="SHORT":
+            if snap["high"]>=snap["ma25"]:
+                basket_rearm_touched=True
+            unlocked = basket_rearm_touched and btc_mode=="SHORT" and snap["close"]<snap["ma25"] and snap["close"]<snap["ma99"]
+        else:
+            if snap["low"]<=snap["ma25"]:
+                basket_rearm_touched=True
+            unlocked = basket_rearm_touched and btc_mode=="LONG" and snap["close"]>snap["ma25"] and snap["close"]>snap["ma99"]
+
+        if not unlocked:
+            save()
+            logging.info("BASKET RE-ARM LOCK %s | touched25=%s | no new entries",
+                         basket_rearm_dir,basket_rearm_touched)
+            return
+
+        msg(f"{basket_rearm_dir} RE-ARMED AFTER MA25 RETEST | NEW CYCLE ENABLED")
+        basket_rearm_dir=""
+        basket_rearm_touched=False
+        basket_lock_candle=0
+        entry_candle=0
+        entries_this_candle=0
+        save()
 
     if basket_lock_candle and closed_candle<=basket_lock_candle:
         return
 
-    # New BTC candle => reset only the per-candle entry counter.
     if closed_candle!=entry_candle:
         entry_candle=closed_candle
         entries_this_candle=0
         save()
 
-    # Keep scanning during the same candle. Stop only after TWO actual entries.
     remaining_for_candle=max(0,2-entries_this_candle)
     if remaining_for_candle<=0:
         return
