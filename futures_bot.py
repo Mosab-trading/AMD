@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V1.6.4.3-MA25-EXIT-MA99-ENTRY"
+BOT_VERSION="V2.0-DUAL-ENGINE-BTC-CONTEXT-DEMO"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -291,12 +291,12 @@ def close_all(reason):
     mine.clear(); cycle_realized=0
     basket_lock_candle=closed_candle_id("BTCUSDT")
 
-    # After a profitable +$50 basket, do NOT start another cycle while BTC
-    # simply continues on the same side of MA25. It must first RETEST MA25.
+    # V2: BTC is context only, never a hard direction gate.
+    # Keep the existing one-closed-candle basket lock; disable MA25 directional re-arm.
     if reason=="BASKET NET +$50":
-        basket_rearm_dir=btc_mode if btc_mode in ("LONG","SHORT") else ""
+        basket_rearm_dir=""
         basket_rearm_touched=False
-        msg(f"BASKET +$50 CLOSED | RE-ARM LOCK {basket_rearm_dir}: waiting for BTC MA25 retest")
+        msg("BASKET +$50 CLOSED | next cycle waits for the next closed BTC 15m candle")
     save()
     return True
 
@@ -419,121 +419,126 @@ def open_position_count():
         logging.warning("open position count failed: %s",e)
         return len(mine)
 
+def rsi_last(vals, period=14):
+    x=pd.Series(vals,dtype=float); d=x.diff()
+    up=d.clip(lower=0).ewm(alpha=1/period,adjust=False).mean()
+    dn=(-d.clip(upper=0)).ewm(alpha=1/period,adjust=False).mean()
+    rs=up/dn.replace(0,np.nan); z=100-(100/(1+rs))
+    return float(z.iloc[-1]) if len(z) and pd.notna(z.iloc[-1]) else 50.0
+
+def btc_context():
+    """BTC flow is a SMALL scoring input only. It cannot block either side."""
+    k=klines("BTCUSDT")
+    if not k or len(k)<100:return {"bias":"NEUTRAL","long_bonus":0.0,"short_bonus":0.0,"score":0.0}
+    c=np.array([float(x[4]) for x in k]); h=np.array([float(x[2]) for x in k])
+    l=np.array([float(x[3]) for x in k]); v=np.array([float(x[5]) for x in k])
+    tb=np.array([float(x[9]) for x in k])
+    e25=float(pd.Series(c).ewm(span=25,adjust=False).mean().iloc[-1])
+    e99=float(pd.Series(c).ewm(span=99,adjust=False).mean().iloc[-1])
+    tp=(h+l+c)/3; vv=v[-20:]
+    vwap=float(np.sum(tp[-20:]*vv)/max(np.sum(vv),1e-12))
+    buy=float(np.sum(tb[-3:])/max(np.sum(v[-3:]),1e-12))
+    vr=float(v[-1]/max(np.mean(v[-20:]),1e-12))
+    score=(2.5 if c[-1]>vwap else -2.5)+(2 if e25>e99 else -2)
+    score+=max(-3,min(3,(buy-.5)*20))
+    if vr>1.2:score+=1.5 if c[-1]>c[-2] else -1.5
+    bias="LONG" if score>=2.5 else "SHORT" if score<=-2.5 else "NEUTRAL"
+    bonus=max(-8,min(8,score))
+    return {"bias":bias,"long_bonus":bonus,"short_bonus":-bonus,"score":score,
+            "buy_ratio":buy,"vol_ratio":vr,"close":float(c[-1]),"vwap":vwap}
+
+def long_engine(s,btc):
+    """Dedicated LONG: trend/reclaim + CHOCH/retest + volume/aggression."""
+    k=klines(s)
+    if not k or len(k)<100:return None
+    o=np.array([float(x[1]) for x in k]); h=np.array([float(x[2]) for x in k])
+    l=np.array([float(x[3]) for x in k]); c=np.array([float(x[4]) for x in k])
+    v=np.array([float(x[5]) for x in k]); tb=np.array([float(x[9]) for x in k])
+    e21=float(pd.Series(c).ewm(span=21,adjust=False).mean().iloc[-1])
+    e55=float(pd.Series(c).ewm(span=55,adjust=False).mean().iloc[-1])
+    tp=(h+l+c)/3; vwap=float(np.sum(tp[-20:]*v[-20:])/max(np.sum(v[-20:]),1e-12))
+    r=rsi_last(c); vr=float(v[-1]/max(np.mean(v[-20:]),1e-12))
+    buy=float(np.sum(tb[-3:])/max(np.sum(v[-3:]),1e-12))
+    prior_high=float(np.max(h[-12:-2]))
+    choch=c[-1]>prior_high or (c[-1]>e21 and c[-2]<=e21)
+    retest=l[-1]<=max(e21,vwap)*1.003 and c[-1]>max(e21,vwap)
+    trend=e21>e55 and c[-1]>e21
+    reclaim=c[-1]>vwap and c[-2]<=vwap
+    impulse=c[-1]>o[-1] and vr>=1.05
+    score=0.0
+    if trend:score+=24
+    if c[-1]>vwap:score+=14
+    if choch:score+=18
+    if retest or reclaim:score+=14
+    if 48<=r<=72:score+=10
+    if buy>=.52:score+=10
+    if impulse:score+=10
+    score+=float(btc.get("long_bonus",0))
+    if not (score>=70 and (choch or retest or reclaim) and (trend or c[-1]>vwap)):return None
+    return {"side":"LONG","score":round(score,2),"tag":"LONG_TREND+VWAP+CHOCH+FLOW",
+            "details":f"rsi={r:.1f} vol={vr:.2f} buy={buy:.2f}"}
+
+def short_engine(s,btc):
+    """Preserve original Liquidity Reversal SHORT trigger; add quality ranking."""
+    ls=liquidity_entry_signal(s)
+    if not ls or ls.get("side")!="SHORT":return None
+    k=klines(s)
+    if not k or len(k)<100:return None
+    o=np.array([float(x[1]) for x in k]); h=np.array([float(x[2]) for x in k])
+    l=np.array([float(x[3]) for x in k]); c=np.array([float(x[4]) for x in k])
+    v=np.array([float(x[5]) for x in k]); tb=np.array([float(x[9]) for x in k])
+    e21=float(pd.Series(c).ewm(span=21,adjust=False).mean().iloc[-1])
+    r=rsi_last(c); vr=float(v[-1]/max(np.mean(v[-20:]),1e-12))
+    buy=float(np.sum(tb[-3:])/max(np.sum(v[-3:]),1e-12))
+    breakdown=c[-1]<e21 or c[-1]<l[-2]
+    rejection=h[-1]>h[-2] and c[-1]<o[-1]
+    score=62.0
+    if breakdown:score+=12
+    if rejection:score+=8
+    if r<58:score+=6
+    if buy<=.48:score+=8
+    if vr>=1.05 and c[-1]<o[-1]:score+=6
+    score+=float(btc.get("short_bonus",0))
+    if score<70:return None
+    return {"side":"SHORT","score":round(score,2),"tag":"SHORT_LIQUIDITY_REVERSAL+QUALITY",
+            "details":f"rsi={r:.1f} vol={vr:.2f} buy={buy:.2f}"}
+
 def scan():
     global btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched,basket_lock_candle
-    snap=btc_ma_snapshot()
-    if not snap:
-        return
-
-    new=sig("BTCUSDT")
-    logging.info("BTC GATE: %s | close %.8g | MA25 %.8g | MA99 %.8g | closed 15m candle",
-                 new,snap["close"],snap["ma25"],snap["ma99"])
-
-    if new!=btc_mode:
-        old_mode=btc_mode
-        msg(f"BTC MODE: {old_mode} -> {new}")
-        # BTC cycle management only:
-        # SHORT -> close all when a CLOSED BTC candle crosses/closes above MA25.
-        # LONG  -> close all when a CLOSED BTC candle crosses/closes below MA25.
-        # Opposite entries still require a close beyond BOTH MA25 and MA99 via sig().
-        if mine and old_mode in ("LONG","SHORT") and new!=old_mode:
-            if not close_all(f"BTC MA25 EXIT {old_mode}->{new}"):
-                return
-        btc_mode=new
-        save()
-
-    if time.time()<pause_until or btc_mode=="WAIT":
-        # A close across MA25 counts as a completed retest for the locked direction.
-        if basket_rearm_dir=="SHORT" and snap["close"]>=snap["ma25"]:
-            if not basket_rearm_touched:
-                basket_rearm_touched=True; save()
-                msg("SHORT RE-ARM: BTC reached/closed at or above MA25; waiting for a CLOSED candle back below MA25")
-        elif basket_rearm_dir=="LONG" and snap["close"]<=snap["ma25"]:
-            if not basket_rearm_touched:
-                basket_rearm_touched=True; save()
-                msg("LONG RE-ARM: BTC reached/closed at or below MA25; waiting for a CLOSED candle back above MA25")
-        return
-
-    closed_candle=snap["candle"]
-
-    # A basket re-arm lock belongs ONLY to the direction of the completed basket.
-    # Example: SHORT basket closed +$50 -> block another SHORT cycle until MA25 retest.
-    # But if BTC later closes above BOTH MA25 and MA99, that is a NEW LONG regime:
-    # discard the stale SHORT re-arm lock and allow LONG immediately.
-    if basket_rearm_dir and btc_mode in ("LONG","SHORT") and btc_mode!=basket_rearm_dir:
-        old_rearm=basket_rearm_dir
-        basket_rearm_dir=""
-        basket_rearm_touched=False
-        basket_lock_candle=0
-        entry_candle=0
-        entries_this_candle=0
-        save()
-        msg(f"BTC NEW {btc_mode} REGIME | cleared old {old_rearm} basket re-arm lock")
-
-    # +$50 basket re-arm rule:
-    # SHORT: while below MA25, no new cycle until BTC retests MA25.
-    #        Direct wick touch + close below unlocks immediately.
-    #        Or close above MA25, then a later close below unlocks.
-    # LONG is the exact mirror.
-    if basket_rearm_dir:
-        if basket_rearm_dir=="SHORT":
-            if snap["high"]>=snap["ma25"]:
-                basket_rearm_touched=True
-            unlocked = basket_rearm_touched and btc_mode=="SHORT" and snap["close"]<snap["ma25"] and snap["close"]<snap["ma99"]
-        else:
-            if snap["low"]<=snap["ma25"]:
-                basket_rearm_touched=True
-            unlocked = basket_rearm_touched and btc_mode=="LONG" and snap["close"]>snap["ma25"] and snap["close"]>snap["ma99"]
-
-        if not unlocked:
-            save()
-            logging.info("BASKET RE-ARM LOCK %s | touched25=%s | no new entries",
-                         basket_rearm_dir,basket_rearm_touched)
-            return
-
-        msg(f"{basket_rearm_dir} RE-ARMED AFTER MA25 RETEST | NEW CYCLE ENABLED")
-        basket_rearm_dir=""
-        basket_rearm_touched=False
-        basket_lock_candle=0
-        entry_candle=0
-        entries_this_candle=0
-        save()
-
-    if basket_lock_candle and closed_candle<=basket_lock_candle:
-        return
-
+    if time.time()<pause_until:return
+    closed_candle=closed_candle_id("BTCUSDT")
+    if not closed_candle:return
+    ctx=btc_context(); btc_mode=ctx["bias"]
+    logging.info("BTC CONTEXT: %s | score %.2f | taker-buy %.3f | vol %.2f | NOT A HARD GATE",
+                 ctx["bias"],ctx["score"],ctx.get("buy_ratio",.5),ctx.get("vol_ratio",1))
+    if basket_lock_candle and closed_candle<=basket_lock_candle:return
     if closed_candle!=entry_candle:
-        entry_candle=closed_candle
-        entries_this_candle=0
-        save()
-
-    remaining_for_candle=max(0,2-entries_this_candle)
-    if remaining_for_candle<=0:
-        return
-
-    slots=max(0,MAX_POS-open_position_count())
-    batch_limit=min(remaining_for_candle,slots)
-    if batch_limit<=0:
-        return
-
-    opened=0
+        entry_candle=closed_candle; entries_this_candle=0; save()
+    limit=min(max(0,2-entries_this_candle),max(0,MAX_POS-open_position_count()))
+    if limit<=0:return
+    candidates=[]
     for s in universe():
-        if opened>=batch_limit:
-            break
-        if s in mine:
-            continue
-        ls=liquidity_entry_signal(s)
-        if ls and ls.get("side")==btc_mode:
-            try:
-                enter(s,btc_mode)
-                opened+=1
-                entries_this_candle+=1
-                save()
-            except Exception as e:
-                logging.warning("%s entry failed: %s",s,e)
-
-    logging.info("BTC CANDLE %s | GATE %s | OPENED %s | CANDLE TOTAL %s/2 | OPEN %s/%s",
-                 closed_candle,btc_mode,opened,entries_this_candle,open_position_count(),MAX_POS)
+        if s in mine:continue
+        try:
+            sh=short_engine(s,ctx)
+            if sh:candidates.append((float(sh["score"]),s,sh))
+            lo=long_engine(s,ctx)
+            if lo:candidates.append((float(lo["score"]),s,lo))
+        except Exception as e:logging.warning("%s scoring failed: %s",s,e)
+    candidates.sort(key=lambda x:x[0],reverse=True)
+    opened=0; used=set()
+    for score,s,setup in candidates:
+        if opened>=limit:break
+        if s in used or s in mine:continue
+        try:
+            enter(s,setup["side"])
+            # enter() writes mine only after a successful protected entry.
+            if s in mine:
+                opened+=1; entries_this_candle+=1; used.add(s); save()
+                logging.info("SELECTED %s %s | score %.2f | %s",setup["side"],s,score,setup["details"])
+        except Exception as e:logging.warning("%s entry failed: %s",s,e)
+    logging.info("BTC CANDLE %s | CONTEXT %s | OPENED %s | CANDLE TOTAL %s/2 | OPEN %s/%s",
+                 closed_candle,ctx["bias"],opened,entries_this_candle,open_position_count(),MAX_POS)
 
 def main():
     if not KEY or not SECRET:raise RuntimeError("Missing Binance demo API keys")
