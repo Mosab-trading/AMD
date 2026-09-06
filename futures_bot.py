@@ -8,16 +8,16 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V2.1.2-BREAKEVEN-SLOTS-MAXQTY-FIX-DEMO"
+BOT_VERSION="V2.1.4-ALL-TODAY-UPDATES-4-PER-CANDLE-DEMO"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
-BASKET=50.0; LOSS_LIMIT=100.0
+BASKET_ACTIVATE=30.0; BASKET_TRAIL=15.0; LOSS_LIMIT=100.0
 ALLOCATED_CAPITAL=float(os.getenv("ALLOCATED_CAPITAL","500"))
 TAKER_FEE_RATE=float(os.getenv("TAKER_FEE_RATE","0.0005"))
 S=requests.Session(); S.headers.update({"X-MBX-APIKEY":KEY})
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
-meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0; bot_realized=0; basket_lock_candle=0; entry_candle=0; entries_this_candle=0; basket_rearm_dir=""; basket_rearm_touched=False
+meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0; bot_realized=0; basket_lock_candle=0; entry_candle=0; entries_this_candle=0; basket_rearm_dir=""; basket_rearm_touched=False; basket_peak_net=0.0; basket_floor_net=None
 STATE="state.json"
 
 def pub(path,p=None):
@@ -93,11 +93,11 @@ def qty_ok(s,x):
     q=float(f"{q:.{prec}f}")
     return q
 def save():
-    with open(STATE,"w") as f: json.dump({"mine":mine,"pause":pause_until,"loss":loss_window,"losing":losing_cycles,"cycle":cycle_realized,"bot_realized":bot_realized,"basket_lock_candle":basket_lock_candle,"btc_mode":btc_mode,"entry_candle":entry_candle,"entries_this_candle":entries_this_candle,"basket_rearm_dir":basket_rearm_dir,"basket_rearm_touched":basket_rearm_touched},f)
+    with open(STATE,"w") as f: json.dump({"mine":mine,"pause":pause_until,"loss":loss_window,"losing":losing_cycles,"cycle":cycle_realized,"bot_realized":bot_realized,"basket_lock_candle":basket_lock_candle,"btc_mode":btc_mode,"entry_candle":entry_candle,"entries_this_candle":entries_this_candle,"basket_rearm_dir":basket_rearm_dir,"basket_rearm_touched":basket_rearm_touched,"basket_peak_net":basket_peak_net,"basket_floor_net":basket_floor_net},f)
 def load():
-    global mine,pause_until,loss_window,losing_cycles,cycle_realized,bot_realized,basket_lock_candle,btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched
+    global mine,pause_until,loss_window,losing_cycles,cycle_realized,bot_realized,basket_lock_candle,btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched,basket_peak_net,basket_floor_net
     try:
-        d=json.load(open(STATE)); mine=d.get("mine",{}); pause_until=d.get("pause",0); loss_window=d.get("loss",0); losing_cycles=d.get("losing",0); cycle_realized=d.get("cycle",0); bot_realized=d.get("bot_realized",0); basket_lock_candle=d.get("basket_lock_candle",0); btc_mode=d.get("btc_mode","WAIT"); entry_candle=d.get("entry_candle",0); entries_this_candle=d.get("entries_this_candle",0); basket_rearm_dir=d.get("basket_rearm_dir",""); basket_rearm_touched=d.get("basket_rearm_touched",False)
+        d=json.load(open(STATE)); mine=d.get("mine",{}); pause_until=d.get("pause",0); loss_window=d.get("loss",0); losing_cycles=d.get("losing",0); cycle_realized=d.get("cycle",0); bot_realized=d.get("bot_realized",0); basket_lock_candle=d.get("basket_lock_candle",0); btc_mode=d.get("btc_mode","WAIT"); entry_candle=d.get("entry_candle",0); entries_this_candle=d.get("entries_this_candle",0); basket_rearm_dir=d.get("basket_rearm_dir",""); basket_rearm_touched=d.get("basket_rearm_touched",False); basket_peak_net=float(d.get("basket_peak_net",0.0) or 0.0); basket_floor_net=d.get("basket_floor_net",None); basket_floor_net=(float(basket_floor_net) if basket_floor_net is not None else None)
     except: pass
 
 def exchange_info():
@@ -246,7 +246,7 @@ def enter(s,d):
     sync_realized()
     msg(f"OPEN {d} {s}\nNotional: $300 | Leverage: {lev}x\nEntry: {ep}\nProfit Lock: +30->SL -25 | +50->BE | +75->SL +25 | TP1 +100% (50%, SL +50) | TP2 +150% (25%, SL +100) | TP3 +200% final")
 def close_all(reason):
-    global cycle_realized,losing_cycles,pause_until,basket_lock_candle,basket_rearm_dir,basket_rearm_touched
+    global cycle_realized,losing_cycles,pause_until,basket_lock_candle,basket_rearm_dir,basket_rearm_touched,basket_peak_net,basket_floor_net
     ps=positions(); targets=[(s,p) for s,p in ps.items() if s in mine]
     cycle_total=cycle_realized+sum(float(p["unRealizedProfit"]) for _,p in targets)
 
@@ -297,14 +297,14 @@ def close_all(reason):
         pause_until=max(pause_until,time.time()+3600); losing_cycles=0; msg("3 losing cycles -> PAUSE 1 HOUR")
 
     mine.clear(); cycle_realized=0
+    basket_peak_net=0.0; basket_floor_net=None
     basket_lock_candle=closed_candle_id("BTCUSDT")
 
-    # V2: BTC is context only, never a hard direction gate.
-    # Keep the existing one-closed-candle basket lock; disable MA25 directional re-arm.
-    if reason=="BASKET NET +$50":
-        basket_rearm_dir=""
-        basket_rearm_touched=False
-        msg("BASKET +$50 CLOSED | next cycle waits for the next closed BTC 15m candle")
+    # BTC remains context only. After any basket-wide close, wait for the next
+    # closed BTC 15m candle before starting a fresh cycle.
+    if reason.startswith("BASKET TRAILING LOCK"):
+        basket_rearm_dir=""; basket_rearm_touched=False
+        msg("BASKET TRAILING PROFIT LOCK CLOSED | next cycle waits for the next closed BTC 15m candle")
     save()
     return True
 
@@ -318,7 +318,7 @@ def protected_stop_for_roi(s,p,d,target_roi):
     return sp
 
 def manage():
-    global pause_until,loss_window
+    global pause_until,loss_window,basket_peak_net,basket_floor_net
     sync_realized()
     ps=positions()
     for s in list(mine):
@@ -329,9 +329,26 @@ def manage():
     gross_total=cycle_realized+sum(float(p["unRealizedProfit"]) for s,p in ps.items() if s in mine)
     expected_close_fees=estimated_exit_fees(ps)
     net_after_close=gross_total-expected_close_fees
-    if mine and net_after_close>=BASKET:
-        msg(f"BASKET NET TARGET ${net_after_close:.2f} AFTER EST. CLOSE FEES -> CLOSE ALL")
-        close_all("BASKET NET +$50")
+
+    # Account-level High-Water Mark. It is based on estimated NET liquidation PnL:
+    # realized cycle PnL + live unrealized PnL - estimated fees to close all bot positions.
+    # It does not alter entries or per-trade Profit Lock. Once activated at +$30,
+    # the protected floor stays exactly $15 below the best net PnL seen and NEVER loosens.
+    if mine and net_after_close>=BASKET_ACTIVATE:
+        new_peak=max(float(basket_peak_net),float(net_after_close))
+        new_floor=new_peak-BASKET_TRAIL
+        changed=(new_peak>basket_peak_net+1e-9) or (basket_floor_net is None)
+        basket_peak_net=new_peak
+        basket_floor_net=max(float(basket_floor_net) if basket_floor_net is not None else -1e18,new_floor)
+        if changed:
+            save()
+            logging.info("BASKET HIGH-WATER | NET $%.2f | PEAK $%.2f | FLOOR $%.2f | TRAIL $%.2f",
+                         net_after_close,basket_peak_net,basket_floor_net,BASKET_TRAIL)
+
+    if mine and basket_floor_net is not None and net_after_close<=basket_floor_net:
+        peak=basket_peak_net; floor_net=basket_floor_net
+        msg(f"BASKET TRAILING LOCK HIT | NET ${net_after_close:.2f} | PEAK ${peak:.2f} | FLOOR ${floor_net:.2f} -> CLOSE ALL")
+        close_all(f"BASKET TRAILING LOCK | peak ${peak:.2f} floor ${floor_net:.2f}")
         return
 
     for s in list(mine):
@@ -582,7 +599,7 @@ def scan():
     if basket_lock_candle and closed_candle<=basket_lock_candle:return
     if closed_candle!=entry_candle:
         entry_candle=closed_candle; entries_this_candle=0; save()
-    limit=min(max(0,2-entries_this_candle),max(0,MAX_POS-risk_position_count()))
+    limit=min(max(0,4-entries_this_candle),max(0,MAX_POS-risk_position_count()))
     if limit<=0:return
     candidates=[]
     for s in universe():
@@ -609,7 +626,7 @@ def scan():
                 opened+=1; entries_this_candle+=1; used.add(s); save()
                 logging.info("SELECTED %s %s | score %.2f | %s",setup["side"],s,score,setup["details"])
         except Exception as e:logging.warning("%s entry failed: %s",s,e)
-    logging.info("BTC CANDLE %s | CONTEXT %s | OPENED %s | CANDLE TOTAL %s/2 | OPEN %s | RISK SLOTS %s/%s",
+    logging.info("BTC CANDLE %s | CONTEXT %s | OPENED %s | CANDLE TOTAL %s/4 | OPEN %s | RISK SLOTS %s/%s",
                  closed_candle,ctx["bias"],opened,entries_this_candle,open_position_count(),risk_position_count(),MAX_POS)
 
 def main():
@@ -619,7 +636,7 @@ def main():
     ps=positions()
     for s in list(mine):
         if s not in ps:mine.pop(s,None)
-    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket: NET +$50 AFTER CLOSE FEES | BTC context controls NEW slots only; BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
+    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket Trailing: activates NET +$30, trails peak by $15 | Max 4 new entries per closed BTC 15m candle | BTC context controls NEW slots only; BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
     last=0
     while True:
         try:
