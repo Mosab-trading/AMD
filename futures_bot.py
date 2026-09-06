@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V2.1.5-DIAGNOSTIC-SLOTS-DEMO"
+BOT_VERSION="V2.1.6-BTC-SCORE-ONLY-BOTH-SIDES-DEMO"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -591,9 +591,7 @@ def scan():
                  ctx["bias"],ctx["score"],ctx.get("buy_ratio",.5),ctx.get("vol_ratio",1))
     # Telegram only when the BTC market state changes; never spam every scan.
     if btc_mode != old_mode:
-        direction_text = ("New positions: LONG only" if btc_mode=="LONG" else
-                          "New positions: SHORT only" if btc_mode=="SHORT" else
-                          "New positions: LONG or SHORT by setup score")
+        direction_text = "New positions: LONG or SHORT by setup score; BTC context is score weight only"
         msg(f"BTC MARKET CHANGE: {old_mode} -> {btc_mode}\n{direction_text}\nExisting positions continue with Profit Lock / SL / TP", bal=False)
         save()
     if basket_lock_candle and closed_candle<=basket_lock_candle:return
@@ -614,14 +612,12 @@ def scan():
     for s in universe():
         if s in mine:continue
         try:
-            # V2.1: market direction controls NEW slots only. Existing positions are never
-            # force-closed on a BTC context flip; they keep their own SL/TP management.
-            if ctx["bias"] in ("SHORT","NEUTRAL"):
-                sh=short_engine(s,ctx)
-                if sh:candidates.append((float(sh["score"]),s,sh))
-            if ctx["bias"] in ("LONG","NEUTRAL"):
-                lo=long_engine(s,ctx)
-                if lo:candidates.append((float(lo["score"]),s,lo))
+            # V2.1.6: BTC context is scoring weight only, never a direction gate.
+            # Evaluate BOTH engines on every symbol and let final setup score rank opportunities.
+            sh=short_engine(s,ctx)
+            if sh:candidates.append((float(sh["score"]),s,sh))
+            lo=long_engine(s,ctx)
+            if lo:candidates.append((float(lo["score"]),s,lo))
         except Exception as e:logging.warning("%s scoring failed: %s",s,e)
     candidates.sort(key=lambda x:x[0],reverse=True)
     opened=0; used=set()
@@ -645,7 +641,7 @@ def main():
     ps=positions()
     for s in list(mine):
         if s not in ps:mine.pop(s,None)
-    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket Trailing: activates NET +$30, trails peak by $15 | Max 4 new entries per closed BTC 15m candle | BTC context controls NEW slots only; BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
+    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket Trailing: activates NET +$30, trails peak by $15 | Max 4 new entries per closed BTC 15m candle | BTC context is SCORE ONLY (both LONG/SHORT always evaluated); BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
     last=0
     while True:
         try:
