@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V2.1.4-ALL-TODAY-UPDATES-4-PER-CANDLE-DEMO"
+BOT_VERSION="V2.1.5-DIAGNOSTIC-SLOTS-DEMO"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -599,7 +599,16 @@ def scan():
     if basket_lock_candle and closed_candle<=basket_lock_candle:return
     if closed_candle!=entry_candle:
         entry_candle=closed_candle; entries_this_candle=0; save()
-    limit=min(max(0,4-entries_this_candle),max(0,MAX_POS-risk_position_count()))
+    # Diagnostic only: show exactly why new entries can/cannot be opened.
+    # This does not change slot accounting, strategy, or entry limits.
+    ps_now=positions()
+    risk_now=risk_position_count(ps_now)
+    be_plus_now=sum(1 for s in ps_now if s in mine and int(mine[s].get("lock_stage",0)) >= 2)
+    free_slots=max(0,MAX_POS-risk_now)
+    candle_left=max(0,4-entries_this_candle)
+    logging.info("POSITIONS %s | RISK %s/%s | BE+ %s | FREE SLOTS %s | CANDLE LEFT %s/4",
+                 len(ps_now),risk_now,MAX_POS,be_plus_now,free_slots,candle_left)
+    limit=min(candle_left,free_slots)
     if limit<=0:return
     candidates=[]
     for s in universe():
