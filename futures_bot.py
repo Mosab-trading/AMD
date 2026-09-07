@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V2.1.6-BTC-SCORE-ONLY-BOTH-SIDES-DEMO"
+BOT_VERSION="V2.1.7-2-PER-CANDLE-DEMO"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -603,8 +603,8 @@ def scan():
     risk_now=risk_position_count(ps_now)
     be_plus_now=sum(1 for s in ps_now if s in mine and int(mine[s].get("lock_stage",0)) >= 2)
     free_slots=max(0,MAX_POS-risk_now)
-    candle_left=max(0,4-entries_this_candle)
-    logging.info("POSITIONS %s | RISK %s/%s | BE+ %s | FREE SLOTS %s | CANDLE LEFT %s/4",
+    candle_left=max(0,2-entries_this_candle)
+    logging.info("POSITIONS %s | RISK %s/%s | BE+ %s | FREE SLOTS %s | CANDLE LEFT %s/2",
                  len(ps_now),risk_now,MAX_POS,be_plus_now,free_slots,candle_left)
     limit=min(candle_left,free_slots)
     if limit<=0:return
@@ -631,7 +631,7 @@ def scan():
                 opened+=1; entries_this_candle+=1; used.add(s); save()
                 logging.info("SELECTED %s %s | score %.2f | %s",setup["side"],s,score,setup["details"])
         except Exception as e:logging.warning("%s entry failed: %s",s,e)
-    logging.info("BTC CANDLE %s | CONTEXT %s | OPENED %s | CANDLE TOTAL %s/4 | OPEN %s | RISK SLOTS %s/%s",
+    logging.info("BTC CANDLE %s | CONTEXT %s | OPENED %s | CANDLE TOTAL %s/2 | OPEN %s | RISK SLOTS %s/%s",
                  closed_candle,ctx["bias"],opened,entries_this_candle,open_position_count(),risk_position_count(),MAX_POS)
 
 def main():
@@ -641,7 +641,7 @@ def main():
     ps=positions()
     for s in list(mine):
         if s not in ps:mine.pop(s,None)
-    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket Trailing: activates NET +$30, trails peak by $15 | Max 4 new entries per closed BTC 15m candle | BTC context is SCORE ONLY (both LONG/SHORT always evaluated); BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
+    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket Trailing: activates NET +$30, trails peak by $15 | Max 2 new entries per closed BTC 15m candle | BTC context is SCORE ONLY (both LONG/SHORT always evaluated); BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
     last=0
     while True:
         try:
