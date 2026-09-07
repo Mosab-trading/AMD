@@ -8,16 +8,16 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V2.1.7-2-PER-CANDLE-DEMO"
+BOT_VERSION="V2.0-DUAL-ENGINE-BTC-CONTEXT-DEMO"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
-BASKET_ACTIVATE=30.0; BASKET_TRAIL=15.0; LOSS_LIMIT=100.0
+BASKET=50.0; LOSS_LIMIT=100.0
 ALLOCATED_CAPITAL=float(os.getenv("ALLOCATED_CAPITAL","500"))
 TAKER_FEE_RATE=float(os.getenv("TAKER_FEE_RATE","0.0005"))
 S=requests.Session(); S.headers.update({"X-MBX-APIKEY":KEY})
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
-meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0; bot_realized=0; basket_lock_candle=0; entry_candle=0; entries_this_candle=0; basket_rearm_dir=""; basket_rearm_touched=False; basket_peak_net=0.0; basket_floor_net=None
+meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0; bot_realized=0; basket_lock_candle=0; entry_candle=0; entries_this_candle=0; basket_rearm_dir=""; basket_rearm_touched=False
 STATE="state.json"
 
 def pub(path,p=None):
@@ -83,21 +83,16 @@ def floor(x,step):
     return float((Decimal(str(x))/Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)*Decimal(str(step)))
 def fmt(x): return f"{x:.12f}".rstrip("0").rstrip(".")
 def qty_ok(s,x):
-    # Respect Binance MARKET_LOT_SIZE maxQty as well as step/precision.
-    # This is intentionally only an execution-safety fix; signal/risk logic is unchanged.
-    max_q=float(meta[s].get("max",0) or 0)
-    if max_q>0:
-        x=min(float(x),max_q)
     q=floor(x,meta[s]["step"])
     prec=meta[s].get("qtyPrecision",8)
     q=float(f"{q:.{prec}f}")
     return q
 def save():
-    with open(STATE,"w") as f: json.dump({"mine":mine,"pause":pause_until,"loss":loss_window,"losing":losing_cycles,"cycle":cycle_realized,"bot_realized":bot_realized,"basket_lock_candle":basket_lock_candle,"btc_mode":btc_mode,"entry_candle":entry_candle,"entries_this_candle":entries_this_candle,"basket_rearm_dir":basket_rearm_dir,"basket_rearm_touched":basket_rearm_touched,"basket_peak_net":basket_peak_net,"basket_floor_net":basket_floor_net},f)
+    with open(STATE,"w") as f: json.dump({"mine":mine,"pause":pause_until,"loss":loss_window,"losing":losing_cycles,"cycle":cycle_realized,"bot_realized":bot_realized,"basket_lock_candle":basket_lock_candle,"btc_mode":btc_mode,"entry_candle":entry_candle,"entries_this_candle":entries_this_candle,"basket_rearm_dir":basket_rearm_dir,"basket_rearm_touched":basket_rearm_touched},f)
 def load():
-    global mine,pause_until,loss_window,losing_cycles,cycle_realized,bot_realized,basket_lock_candle,btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched,basket_peak_net,basket_floor_net
+    global mine,pause_until,loss_window,losing_cycles,cycle_realized,bot_realized,basket_lock_candle,btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched
     try:
-        d=json.load(open(STATE)); mine=d.get("mine",{}); pause_until=d.get("pause",0); loss_window=d.get("loss",0); losing_cycles=d.get("losing",0); cycle_realized=d.get("cycle",0); bot_realized=d.get("bot_realized",0); basket_lock_candle=d.get("basket_lock_candle",0); btc_mode=d.get("btc_mode","WAIT"); entry_candle=d.get("entry_candle",0); entries_this_candle=d.get("entries_this_candle",0); basket_rearm_dir=d.get("basket_rearm_dir",""); basket_rearm_touched=d.get("basket_rearm_touched",False); basket_peak_net=float(d.get("basket_peak_net",0.0) or 0.0); basket_floor_net=d.get("basket_floor_net",None); basket_floor_net=(float(basket_floor_net) if basket_floor_net is not None else None)
+        d=json.load(open(STATE)); mine=d.get("mine",{}); pause_until=d.get("pause",0); loss_window=d.get("loss",0); losing_cycles=d.get("losing",0); cycle_realized=d.get("cycle",0); bot_realized=d.get("bot_realized",0); basket_lock_candle=d.get("basket_lock_candle",0); btc_mode=d.get("btc_mode","WAIT"); entry_candle=d.get("entry_candle",0); entries_this_candle=d.get("entries_this_candle",0); basket_rearm_dir=d.get("basket_rearm_dir",""); basket_rearm_touched=d.get("basket_rearm_touched",False)
     except: pass
 
 def exchange_info():
@@ -105,7 +100,7 @@ def exchange_info():
     for s in pub("/fapi/v1/exchangeInfo")["symbols"]:
         if s.get("quoteAsset")!="USDT" or s.get("contractType")!="PERPETUAL" or s.get("status")!="TRADING": continue
         fs={x["filterType"]:x for x in s["filters"]}; lot=fs.get("MARKET_LOT_SIZE",fs.get("LOT_SIZE",{})); pf=fs.get("PRICE_FILTER",{})
-        meta[s["symbol"]]={"step":float(lot.get("stepSize",".001")),"min":float(lot.get("minQty","0")),"max":float(lot.get("maxQty","0") or 0),"tick":float(pf.get("tickSize",".0001")),"qtyPrecision":int(s.get("quantityPrecision",8))}
+        meta[s["symbol"]]={"step":float(lot.get("stepSize",".001")),"min":float(lot.get("minQty","0")),"tick":float(pf.get("tickSize",".0001")),"qtyPrecision":int(s.get("quantityPrecision",8))}
 def positions():
     return {p["symbol"]:p for p in signed("GET","/fapi/v2/positionRisk") if abs(float(p["positionAmt"]))>0}
 def pos(s):
@@ -226,9 +221,7 @@ def close(s,p,pct,reason):
 def enter(s,d):
     if s in mine:return
     ps=positions()
-    # A bot-owned position at breakeven or better (lock_stage >= 2) no longer
-    # consumes one of the 20 RISK slots. It stays open and managed normally.
-    if risk_position_count(ps)>=MAX_POS or s in ps:return
+    if len(ps)>=MAX_POS or s in ps:return
     px=float(pub("/fapi/v1/ticker/price",{"symbol":s})["price"]); lev=leverage(s)
     qty=qty_ok(s,NOTIONAL/px)
     if qty<meta[s]["min"] or qty<=0:return
@@ -238,15 +231,14 @@ def enter(s,d):
     sp=ep*(1-adverse) if d=="LONG" else ep*(1+adverse)
     cancel_algo(s)
     stop(s,d,sp)
-    # V2.1: keep ONE exchange-side protective STOP only. Profit targets are managed
-    # by manage() from live leveraged ROI. This prevents -4045 max algo/stop-order saturation.
-    mine[s]={"dir":d,"tp1":False,"tp2":False,"lock_stage":0,
+    tp1_px,tp2_px,tp3_px=place_targets(s,d,ep,lev,abs(float(p["positionAmt"])))
+    mine[s]={"dir":d,"tp1":False,"tp2":False,"tp1_px":tp1_px,"tp2_px":tp2_px,"tp3_px":tp3_px,
              "initial_qty":abs(float(p["positionAmt"])),"entry_time":int(time.time()*1000)-10000,
              "accounted_trade_ids":[]}; save()
     sync_realized()
-    msg(f"OPEN {d} {s}\nNotional: $300 | Leverage: {lev}x\nEntry: {ep}\nProfit Lock: +30->SL -25 | +50->BE | +75->SL +25 | TP1 +100% (50%, SL +50) | TP2 +150% (25%, SL +100) | TP3 +200% final")
+    msg(f"OPEN {d} {s}\nNotional: $300 | Leverage: {lev}x\nEntry: {ep}\nSL: -50% ROI | TP1: +100% (50%) | TP2: +150% (25%) | TP3: +200% (25%)")
 def close_all(reason):
-    global cycle_realized,losing_cycles,pause_until,basket_lock_candle,basket_rearm_dir,basket_rearm_touched,basket_peak_net,basket_floor_net
+    global cycle_realized,losing_cycles,pause_until,basket_lock_candle,basket_rearm_dir,basket_rearm_touched
     ps=positions(); targets=[(s,p) for s,p in ps.items() if s in mine]
     cycle_total=cycle_realized+sum(float(p["unRealizedProfit"]) for _,p in targets)
 
@@ -297,111 +289,62 @@ def close_all(reason):
         pause_until=max(pause_until,time.time()+3600); losing_cycles=0; msg("3 losing cycles -> PAUSE 1 HOUR")
 
     mine.clear(); cycle_realized=0
-    basket_peak_net=0.0; basket_floor_net=None
     basket_lock_candle=closed_candle_id("BTCUSDT")
 
-    # BTC remains context only. After any basket-wide close, wait for the next
-    # closed BTC 15m candle before starting a fresh cycle.
-    if reason.startswith("BASKET TRAILING LOCK"):
-        basket_rearm_dir=""; basket_rearm_touched=False
-        msg("BASKET TRAILING PROFIT LOCK CLOSED | next cycle waits for the next closed BTC 15m candle")
+    # V2: BTC is context only, never a hard direction gate.
+    # Keep the existing one-closed-candle basket lock; disable MA25 directional re-arm.
+    if reason=="BASKET NET +$50":
+        basket_rearm_dir=""
+        basket_rearm_touched=False
+        msg("BASKET +$50 CLOSED | next cycle waits for the next closed BTC 15m candle")
     save()
     return True
 
-def protected_stop_for_roi(s,p,d,target_roi):
-    """Replace the single exchange-side STOP so a retrace locks target leveraged ROI."""
-    ep=float(p["entryPrice"]); lev=float(p.get("leverage",20))
-    move=(float(target_roi)/100.0)/max(lev,1.0)
-    sp=ep*(1+move) if d=="LONG" else ep*(1-move)
-    cancel_algo(s)
-    stop(s,d,sp)
-    return sp
-
 def manage():
-    global pause_until,loss_window,basket_peak_net,basket_floor_net
+    global pause_until,loss_window
+    # First reconcile actual fills (TP/SL/partial/manual basket) including commissions.
     sync_realized()
     ps=positions()
     for s in list(mine):
         if s not in ps:
+            # One final reconciliation before forgetting the symbol.
             sync_realized()
+            final_bal=bot_balance()
             mine.pop(s,None); save()
             msg(f"{s} CLOSED ON EXCHANGE | Actual PnL reconciled")
     gross_total=cycle_realized+sum(float(p["unRealizedProfit"]) for s,p in ps.items() if s in mine)
     expected_close_fees=estimated_exit_fees(ps)
     net_after_close=gross_total-expected_close_fees
-
-    # Account-level High-Water Mark. It is based on estimated NET liquidation PnL:
-    # realized cycle PnL + live unrealized PnL - estimated fees to close all bot positions.
-    # It does not alter entries or per-trade Profit Lock. Once activated at +$30,
-    # the protected floor stays exactly $15 below the best net PnL seen and NEVER loosens.
-    if mine and net_after_close>=BASKET_ACTIVATE:
-        new_peak=max(float(basket_peak_net),float(net_after_close))
-        new_floor=new_peak-BASKET_TRAIL
-        changed=(new_peak>basket_peak_net+1e-9) or (basket_floor_net is None)
-        basket_peak_net=new_peak
-        basket_floor_net=max(float(basket_floor_net) if basket_floor_net is not None else -1e18,new_floor)
-        if changed:
-            save()
-            logging.info("BASKET HIGH-WATER | NET $%.2f | PEAK $%.2f | FLOOR $%.2f | TRAIL $%.2f",
-                         net_after_close,basket_peak_net,basket_floor_net,BASKET_TRAIL)
-
-    if mine and basket_floor_net is not None and net_after_close<=basket_floor_net:
-        peak=basket_peak_net; floor_net=basket_floor_net
-        msg(f"BASKET TRAILING LOCK HIT | NET ${net_after_close:.2f} | PEAK ${peak:.2f} | FLOOR ${floor_net:.2f} -> CLOSE ALL")
-        close_all(f"BASKET TRAILING LOCK | peak ${peak:.2f} floor ${floor_net:.2f}")
+    if mine and net_after_close>=BASKET:
+        msg(f"BASKET NET TARGET ${net_after_close:.2f} AFTER EST. CLOSE FEES -> CLOSE ALL")
+        close_all("BASKET NET +$50")
         return
-
     for s in list(mine):
         p=ps.get(s)
-        if not p: continue
+        if not p:continue
         d="LONG" if float(p["positionAmt"])>0 else "SHORT"
-        r=roi(p)
-        st=int(mine[s].get("lock_stage",0))
-        initial_qty=float(mine[s].get("initial_qty",abs(float(p["positionAmt"]))))
-
-        try:
-            # Stair-step profit protection. Stages only move forward; never loosen a stop.
-            if r>=200 and st<6:
-                cancel_algo(s)
-                close(s,p,100,"TP3 +200% ROI FINAL")
-                mine[s]["lock_stage"]=6; save()
-                continue
-            if r>=150 and st<5:
-                # Close 25% of ORIGINAL size (normally 50% of the remaining half).
-                live_qty=abs(float(p["positionAmt"]))
-                q_pct=min(100.0,100.0*(initial_qty*0.25)/max(live_qty,1e-12))
-                cancel_algo(s); close(s,p,q_pct,"TP2 +150% ROI (25% ORIGINAL)")
-                time.sleep(.25); lp=pos(s)
-                if lp: protected_stop_for_roi(s,lp,d,100)
-                mine[s]["tp2"]=True; mine[s]["lock_stage"]=5; save()
-                msg(f"{s} PROFIT LOCK | TP2 DONE | Remaining SL -> +100% ROI")
-                continue
-            if r>=100 and st<4:
-                cancel_algo(s); close(s,p,50,"TP1 +100% ROI (50%)")
-                time.sleep(.25); lp=pos(s)
-                if lp: protected_stop_for_roi(s,lp,d,50)
-                mine[s]["tp1"]=True; mine[s]["lock_stage"]=4; save()
-                msg(f"{s} PROFIT LOCK | TP1 DONE | Remaining SL -> +50% ROI")
-                continue
-            if r>=75 and st<3:
-                protected_stop_for_roi(s,p,d,25)
-                mine[s]["lock_stage"]=3; save()
-                msg(f"{s} PROFIT LOCK | ROI +75% -> SL +25% ROI")
-                continue
-            if r>=50 and st<2:
-                protected_stop_for_roi(s,p,d,0)
-                mine[s]["lock_stage"]=2; save()
-                msg(f"{s} PROFIT LOCK | ROI +50% -> SL BREAKEVEN")
-                continue
-            if r>=30 and st<1:
-                protected_stop_for_roi(s,p,d,-25)
-                mine[s]["lock_stage"]=1; save()
-                msg(f"{s} PROFIT LOCK | ROI +30% -> SL -25% ROI")
-                continue
-        except Exception as e:
-            logging.warning("%s profit-lock management failed: %s",s,e)
-            # Best effort: if stop replacement/partial close failed, do not advance stage.
-
+        # Trade management belongs to Liquidity Reversal Staged.
+        # BTC controls basket direction globally; individual coin MA changes do NOT close the trade.
+        current_qty=abs(float(p["positionAmt"]))
+        initial_qty=float(mine[s].get("initial_qty",current_qty))
+        if not mine[s].get("tp1",False) and initial_qty>0 and current_qty <= initial_qty*0.55:
+            # TP1 (+100% ROI) filled: protect remaining 50% at breakeven,
+            # then restore TP2 (+150%, 25% original) and TP3 (+200%, final 25%).
+            cancel_algo(s)
+            ep=float(p["entryPrice"])
+            stop(s,d,ep)
+            lev=float(p.get("leverage",20))
+            q2=qty_ok(s,initial_qty*0.25)
+            q3=qty_ok(s,max(0.0,current_qty-q2))
+            tp2=ep*(1+1.50/max(lev,1)) if d=="LONG" else ep*(1-1.50/max(lev,1))
+            tp3=ep*(1+2.00/max(lev,1)) if d=="LONG" else ep*(1-2.00/max(lev,1))
+            if q2>0: algo_close(s,d,"TAKE_PROFIT_MARKET",tp2,qty=q2)
+            if q3>0: algo_close(s,d,"TAKE_PROFIT_MARKET",tp3,qty=q3)
+            mine[s]["tp1"]=True; save()
+            msg(f"{s} TP1 +100% ROI EXECUTED (50%)\nSL -> BREAKEVEN\nTP2 +150% (25%) | TP3 +200% (25%)")
+        elif mine[s].get("tp1",False) and not mine[s].get("tp2",False) and initial_qty>0 and current_qty <= initial_qty*0.30:
+            mine[s]["tp2"]=True; save()
+            msg(f"{s} TP2 +150% ROI EXECUTED (25%)\nFinal 25% targeting +200% ROI")
     if loss_window<=-LOSS_LIMIT and time.time()>=pause_until:
         pause_until=time.time()+10800; loss_window=0; save(); msg("Loss window reached -$100 -> PAUSE 3 HOURS")
 
@@ -475,25 +418,6 @@ def open_position_count():
     except Exception as e:
         logging.warning("open position count failed: %s",e)
         return len(mine)
-
-def risk_position_count(ps=None):
-    """Count only positions that still consume a risk slot.
-
-    Bot-owned positions whose stop has reached breakeven or better
-    (lock_stage >= 2) are excluded. Unknown/account positions remain counted
-    conservatively so this change cannot silently ignore another position.
-    """
-    try:
-        ps = ps if ps is not None else positions()
-        n=0
-        for s in ps:
-            st=mine.get(s)
-            if st is None or int(st.get("lock_stage",0)) < 2:
-                n += 1
-        return n
-    except Exception as e:
-        logging.warning("risk position count failed: %s",e)
-        return sum(1 for s,st in mine.items() if int(st.get("lock_stage",0)) < 2)
 
 def rsi_last(vals, period=14):
     x=pd.Series(vals,dtype=float); d=x.diff()
@@ -584,36 +508,18 @@ def scan():
     if time.time()<pause_until:return
     closed_candle=closed_candle_id("BTCUSDT")
     if not closed_candle:return
-    ctx=btc_context()
-    old_mode=btc_mode
-    btc_mode=ctx["bias"]
+    ctx=btc_context(); btc_mode=ctx["bias"]
     logging.info("BTC CONTEXT: %s | score %.2f | taker-buy %.3f | vol %.2f | NOT A HARD GATE",
                  ctx["bias"],ctx["score"],ctx.get("buy_ratio",.5),ctx.get("vol_ratio",1))
-    # Telegram only when the BTC market state changes; never spam every scan.
-    if btc_mode != old_mode:
-        direction_text = "New positions: LONG or SHORT by setup score; BTC context is score weight only"
-        msg(f"BTC MARKET CHANGE: {old_mode} -> {btc_mode}\n{direction_text}\nExisting positions continue with Profit Lock / SL / TP", bal=False)
-        save()
     if basket_lock_candle and closed_candle<=basket_lock_candle:return
     if closed_candle!=entry_candle:
         entry_candle=closed_candle; entries_this_candle=0; save()
-    # Diagnostic only: show exactly why new entries can/cannot be opened.
-    # This does not change slot accounting, strategy, or entry limits.
-    ps_now=positions()
-    risk_now=risk_position_count(ps_now)
-    be_plus_now=sum(1 for s in ps_now if s in mine and int(mine[s].get("lock_stage",0)) >= 2)
-    free_slots=max(0,MAX_POS-risk_now)
-    candle_left=max(0,2-entries_this_candle)
-    logging.info("POSITIONS %s | RISK %s/%s | BE+ %s | FREE SLOTS %s | CANDLE LEFT %s/2",
-                 len(ps_now),risk_now,MAX_POS,be_plus_now,free_slots,candle_left)
-    limit=min(candle_left,free_slots)
+    limit=min(max(0,2-entries_this_candle),max(0,MAX_POS-open_position_count()))
     if limit<=0:return
     candidates=[]
     for s in universe():
         if s in mine:continue
         try:
-            # V2.1.6: BTC context is scoring weight only, never a direction gate.
-            # Evaluate BOTH engines on every symbol and let final setup score rank opportunities.
             sh=short_engine(s,ctx)
             if sh:candidates.append((float(sh["score"]),s,sh))
             lo=long_engine(s,ctx)
@@ -631,8 +537,8 @@ def scan():
                 opened+=1; entries_this_candle+=1; used.add(s); save()
                 logging.info("SELECTED %s %s | score %.2f | %s",setup["side"],s,score,setup["details"])
         except Exception as e:logging.warning("%s entry failed: %s",s,e)
-    logging.info("BTC CANDLE %s | CONTEXT %s | OPENED %s | CANDLE TOTAL %s/2 | OPEN %s | RISK SLOTS %s/%s",
-                 closed_candle,ctx["bias"],opened,entries_this_candle,open_position_count(),risk_position_count(),MAX_POS)
+    logging.info("BTC CANDLE %s | CONTEXT %s | OPENED %s | CANDLE TOTAL %s/2 | OPEN %s/%s",
+                 closed_candle,ctx["bias"],opened,entries_this_candle,open_position_count(),MAX_POS)
 
 def main():
     if not KEY or not SECRET:raise RuntimeError("Missing Binance demo API keys")
@@ -641,7 +547,7 @@ def main():
     ps=positions()
     for s in list(mine):
         if s not in ps:mine.pop(s,None)
-    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket Trailing: activates NET +$30, trails peak by $15 | Max 2 new entries per closed BTC 15m candle | BTC context is SCORE ONLY (both LONG/SHORT always evaluated); BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
+    msg(f"MA BTC Sync Bot {BOT_VERSION} STARTED\n15m SMA 7/25/99 | Allocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket: NET +$50 AFTER CLOSE FEES | BTC MA25/99 = direction/exit gate | Liquidity Reversal Staged TRAP/PO3+RSI = coin selection/entry | SL50 TP100/150/200\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
     last=0
     while True:
         try:
