@@ -8,11 +8,11 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V2.1.4-ALL-TODAY-UPDATES-4-PER-CANDLE-DEMO"
-TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
+BOT_VERSION="V2.2-BTC-REGIME-40-FIXED-SLTP-BASKET20-DEMO"
+TF="15m"; NOTIONAL=150.0; TARGET_LEV=20; MAX_POS=40
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
-BASKET_ACTIVATE=30.0; BASKET_TRAIL=15.0; LOSS_LIMIT=100.0
+BASKET_TARGET=20.0; LOSS_LIMIT=100.0
 ALLOCATED_CAPITAL=float(os.getenv("ALLOCATED_CAPITAL","500"))
 TAKER_FEE_RATE=float(os.getenv("TAKER_FEE_RATE","0.0005"))
 S=requests.Session(); S.headers.update({"X-MBX-APIKEY":KEY})
@@ -226,27 +226,37 @@ def close(s,p,pct,reason):
 def enter(s,d):
     if s in mine:return
     ps=positions()
-    # A bot-owned position at breakeven or better (lock_stage >= 2) no longer
-    # consumes one of the 20 RISK slots. It stays open and managed normally.
-    if risk_position_count(ps)>=MAX_POS or s in ps:return
+    # V2.2: maximum is 40 ACTUAL open exchange positions. No BE/risk-slot recycling.
+    if len(ps)>=MAX_POS or s in ps:return
     px=float(pub("/fapi/v1/ticker/price",{"symbol":s})["price"]); lev=leverage(s)
     qty=qty_ok(s,NOTIONAL/px)
     if qty<meta[s]["min"] or qty<=0:return
     market(s,"BUY" if d=="LONG" else "SELL",qty); time.sleep(.25); p=pos(s)
     if not p:return
-    ep=float(p["entryPrice"]); adverse=.50/lev
-    sp=ep*(1-adverse) if d=="LONG" else ep*(1+adverse)
+    ep=float(p["entryPrice"])
+    # Fixed leveraged ROI exits: SL -30%, TP +60%.
+    sl_move=.30/max(lev,1); tp_move=.60/max(lev,1)
+    sp=ep*(1-sl_move) if d=="LONG" else ep*(1+sl_move)
+    tp=ep*(1+tp_move) if d=="LONG" else ep*(1-tp_move)
     cancel_algo(s)
-    stop(s,d,sp)
-    # V2.1: keep ONE exchange-side protective STOP only. Profit targets are managed
-    # by manage() from live leveraged ROI. This prevents -4045 max algo/stop-order saturation.
-    mine[s]={"dir":d,"tp1":False,"tp2":False,"lock_stage":0,
-             "initial_qty":abs(float(p["positionAmt"])),"entry_time":int(time.time()*1000)-10000,
+    try:
+        stop(s,d,sp)
+        algo_close(s,d,"TAKE_PROFIT_MARKET",tp,close_position=True)
+    except Exception:
+        # Never intentionally leave a fresh entry unprotected.
+        try:
+            live=pos(s)
+            if live: market(s,"SELL" if d=="LONG" else "BUY",abs(float(live["positionAmt"])),True)
+        finally:
+            cancel_algo(s)
+        raise
+    mine[s]={"dir":d,"entry_time":int(time.time()*1000)-10000,
              "accounted_trade_ids":[]}; save()
     sync_realized()
-    msg(f"OPEN {d} {s}\nNotional: $300 | Leverage: {lev}x\nEntry: {ep}\nProfit Lock: +30->SL -25 | +50->BE | +75->SL +25 | TP1 +100% (50%, SL +50) | TP2 +150% (25%, SL +100) | TP3 +200% final")
+    msg(f"OPEN {d} {s}\nNotional: $150 | Leverage: {lev}x\nEntry: {ep}\nSL: -30% ROI | TP: +60% ROI")
+
 def close_all(reason):
-    global cycle_realized,losing_cycles,pause_until,basket_lock_candle,basket_rearm_dir,basket_rearm_touched,basket_peak_net,basket_floor_net
+    global cycle_realized,losing_cycles,pause_until,basket_lock_candle,basket_rearm_dir,basket_rearm_touched
     ps=positions(); targets=[(s,p) for s,p in ps.items() if s in mine]
     cycle_total=cycle_realized+sum(float(p["unRealizedProfit"]) for _,p in targets)
 
@@ -297,14 +307,7 @@ def close_all(reason):
         pause_until=max(pause_until,time.time()+3600); losing_cycles=0; msg("3 losing cycles -> PAUSE 1 HOUR")
 
     mine.clear(); cycle_realized=0
-    basket_peak_net=0.0; basket_floor_net=None
     basket_lock_candle=closed_candle_id("BTCUSDT")
-
-    # BTC remains context only. After any basket-wide close, wait for the next
-    # closed BTC 15m candle before starting a fresh cycle.
-    if reason.startswith("BASKET TRAILING LOCK"):
-        basket_rearm_dir=""; basket_rearm_touched=False
-        msg("BASKET TRAILING PROFIT LOCK CLOSED | next cycle waits for the next closed BTC 15m candle")
     save()
     return True
 
@@ -318,7 +321,7 @@ def protected_stop_for_roi(s,p,d,target_roi):
     return sp
 
 def manage():
-    global pause_until,loss_window,basket_peak_net,basket_floor_net
+    global pause_until,loss_window,basket_rearm_dir,basket_rearm_touched
     sync_realized()
     ps=positions()
     for s in list(mine):
@@ -326,81 +329,22 @@ def manage():
             sync_realized()
             mine.pop(s,None); save()
             msg(f"{s} CLOSED ON EXCHANGE | Actual PnL reconciled")
+
+    # Fixed basket target: close the whole bot basket at NET +$20 after estimated close fees.
     gross_total=cycle_realized+sum(float(p["unRealizedProfit"]) for s,p in ps.items() if s in mine)
     expected_close_fees=estimated_exit_fees(ps)
     net_after_close=gross_total-expected_close_fees
-
-    # Account-level High-Water Mark. It is based on estimated NET liquidation PnL:
-    # realized cycle PnL + live unrealized PnL - estimated fees to close all bot positions.
-    # It does not alter entries or per-trade Profit Lock. Once activated at +$30,
-    # the protected floor stays exactly $15 below the best net PnL seen and NEVER loosens.
-    if mine and net_after_close>=BASKET_ACTIVATE:
-        new_peak=max(float(basket_peak_net),float(net_after_close))
-        new_floor=new_peak-BASKET_TRAIL
-        changed=(new_peak>basket_peak_net+1e-9) or (basket_floor_net is None)
-        basket_peak_net=new_peak
-        basket_floor_net=max(float(basket_floor_net) if basket_floor_net is not None else -1e18,new_floor)
-        if changed:
+    if mine and net_after_close>=BASKET_TARGET:
+        locked_dir=btc_mode if btc_mode in ("LONG","SHORT") else ""
+        msg(f"BASKET NET +$20 HIT | NET ${net_after_close:.2f} -> CLOSE ALL")
+        if close_all(f"BASKET NET +$20 | net ${net_after_close:.2f}"):
+            # Do not re-enter this regime until BTC leaves it and later returns to it.
+            basket_rearm_dir=locked_dir
+            basket_rearm_touched=False
             save()
-            logging.info("BASKET HIGH-WATER | NET $%.2f | PEAK $%.2f | FLOOR $%.2f | TRAIL $%.2f",
-                         net_after_close,basket_peak_net,basket_floor_net,BASKET_TRAIL)
-
-    if mine and basket_floor_net is not None and net_after_close<=basket_floor_net:
-        peak=basket_peak_net; floor_net=basket_floor_net
-        msg(f"BASKET TRAILING LOCK HIT | NET ${net_after_close:.2f} | PEAK ${peak:.2f} | FLOOR ${floor_net:.2f} -> CLOSE ALL")
-        close_all(f"BASKET TRAILING LOCK | peak ${peak:.2f} floor ${floor_net:.2f}")
+            if locked_dir:
+                msg(f"BASKET LOCK: {locked_dir} blocked until BTC changes away and returns")
         return
-
-    for s in list(mine):
-        p=ps.get(s)
-        if not p: continue
-        d="LONG" if float(p["positionAmt"])>0 else "SHORT"
-        r=roi(p)
-        st=int(mine[s].get("lock_stage",0))
-        initial_qty=float(mine[s].get("initial_qty",abs(float(p["positionAmt"]))))
-
-        try:
-            # Stair-step profit protection. Stages only move forward; never loosen a stop.
-            if r>=200 and st<6:
-                cancel_algo(s)
-                close(s,p,100,"TP3 +200% ROI FINAL")
-                mine[s]["lock_stage"]=6; save()
-                continue
-            if r>=150 and st<5:
-                # Close 25% of ORIGINAL size (normally 50% of the remaining half).
-                live_qty=abs(float(p["positionAmt"]))
-                q_pct=min(100.0,100.0*(initial_qty*0.25)/max(live_qty,1e-12))
-                cancel_algo(s); close(s,p,q_pct,"TP2 +150% ROI (25% ORIGINAL)")
-                time.sleep(.25); lp=pos(s)
-                if lp: protected_stop_for_roi(s,lp,d,100)
-                mine[s]["tp2"]=True; mine[s]["lock_stage"]=5; save()
-                msg(f"{s} PROFIT LOCK | TP2 DONE | Remaining SL -> +100% ROI")
-                continue
-            if r>=100 and st<4:
-                cancel_algo(s); close(s,p,50,"TP1 +100% ROI (50%)")
-                time.sleep(.25); lp=pos(s)
-                if lp: protected_stop_for_roi(s,lp,d,50)
-                mine[s]["tp1"]=True; mine[s]["lock_stage"]=4; save()
-                msg(f"{s} PROFIT LOCK | TP1 DONE | Remaining SL -> +50% ROI")
-                continue
-            if r>=75 and st<3:
-                protected_stop_for_roi(s,p,d,25)
-                mine[s]["lock_stage"]=3; save()
-                msg(f"{s} PROFIT LOCK | ROI +75% -> SL +25% ROI")
-                continue
-            if r>=50 and st<2:
-                protected_stop_for_roi(s,p,d,0)
-                mine[s]["lock_stage"]=2; save()
-                msg(f"{s} PROFIT LOCK | ROI +50% -> SL BREAKEVEN")
-                continue
-            if r>=30 and st<1:
-                protected_stop_for_roi(s,p,d,-25)
-                mine[s]["lock_stage"]=1; save()
-                msg(f"{s} PROFIT LOCK | ROI +30% -> SL -25% ROI")
-                continue
-        except Exception as e:
-            logging.warning("%s profit-lock management failed: %s",s,e)
-            # Best effort: if stop replacement/partial close failed, do not advance stage.
 
     if loss_window<=-LOSS_LIMIT and time.time()>=pause_until:
         pause_until=time.time()+10800; loss_window=0; save(); msg("Loss window reached -$100 -> PAUSE 3 HOURS")
@@ -580,54 +524,68 @@ def short_engine(s,btc):
             "details":f"rsi={r:.1f} vol={vr:.2f} buy={buy:.2f}"}
 
 def scan():
-    global btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched,basket_lock_candle
+    global btc_mode,basket_rearm_dir,basket_rearm_touched
     if time.time()<pause_until:return
-    closed_candle=closed_candle_id("BTCUSDT")
-    if not closed_candle:return
     ctx=btc_context()
+    new_mode=ctx["bias"]
     old_mode=btc_mode
-    btc_mode=ctx["bias"]
-    logging.info("BTC CONTEXT: %s | score %.2f | taker-buy %.3f | vol %.2f | NOT A HARD GATE",
-                 ctx["bias"],ctx["score"],ctx.get("buy_ratio",.5),ctx.get("vol_ratio",1))
-    # Telegram only when the BTC market state changes; never spam every scan.
-    if btc_mode != old_mode:
-        direction_text = ("New positions: LONG only" if btc_mode=="LONG" else
-                          "New positions: SHORT only" if btc_mode=="SHORT" else
-                          "New positions: LONG or SHORT by setup score")
-        msg(f"BTC MARKET CHANGE: {old_mode} -> {btc_mode}\n{direction_text}\nExisting positions continue with Profit Lock / SL / TP", bal=False)
+    logging.info("BTC CONTEXT: %s | score %.2f | taker-buy %.3f | vol %.2f | HARD DIRECTION GATE",
+                 new_mode,ctx["score"],ctx.get("buy_ratio",.5),ctx.get("vol_ratio",1))
+
+    # Any BTC regime change closes every bot-owned position immediately.
+    if new_mode != old_mode:
+        if mine:
+            msg(f"BTC MARKET CHANGE: {old_mode} -> {new_mode} | CLOSE ALL EXISTING POSITIONS",bal=False)
+            close_all(f"BTC REGIME CHANGE {old_mode}->{new_mode}")
+        btc_mode=new_mode
+
+        # Basket re-arm: after a basket hit, BTC must leave the locked regime and RETURN.
+        if basket_rearm_dir:
+            if new_mode != basket_rearm_dir:
+                basket_rearm_touched=True
+            elif basket_rearm_touched and new_mode == basket_rearm_dir:
+                msg(f"BASKET RE-ARMED: BTC returned to {basket_rearm_dir}",bal=False)
+                basket_rearm_dir=""; basket_rearm_touched=False
+        msg(f"BTC MARKET CHANGE: {old_mode} -> {new_mode} | New entries follow {new_mode if new_mode in ('LONG','SHORT') else 'WAIT'}",bal=False)
         save()
-    if basket_lock_candle and closed_candle<=basket_lock_candle:return
-    if closed_candle!=entry_candle:
-        entry_candle=closed_candle; entries_this_candle=0; save()
-    limit=min(max(0,4-entries_this_candle),max(0,MAX_POS-risk_position_count()))
-    if limit<=0:return
+    else:
+        btc_mode=new_mode
+
+    # If basket target was hit, block ALL new entries until BTC leaves that regime and returns.
+    if basket_rearm_dir:
+        logging.info("BASKET LOCK ACTIVE | waiting for BTC to leave %s and return | current %s | touched=%s",
+                     basket_rearm_dir,btc_mode,basket_rearm_touched)
+        return
+
+    # No entries in neutral/wait. LONG opens only LONG setups; SHORT opens only SHORT setups.
+    if btc_mode not in ("LONG","SHORT"):return
+    ps=positions()
+    free=max(0,MAX_POS-len(ps))
+    if free<=0:
+        logging.info("POSITIONS %s/%s | NO FREE SLOTS",len(ps),MAX_POS)
+        return
+
     candidates=[]
     for s in universe():
-        if s in mine:continue
+        if s in mine or s in ps:continue
         try:
-            # V2.1: market direction controls NEW slots only. Existing positions are never
-            # force-closed on a BTC context flip; they keep their own SL/TP management.
-            if ctx["bias"] in ("SHORT","NEUTRAL"):
-                sh=short_engine(s,ctx)
-                if sh:candidates.append((float(sh["score"]),s,sh))
-            if ctx["bias"] in ("LONG","NEUTRAL"):
-                lo=long_engine(s,ctx)
-                if lo:candidates.append((float(lo["score"]),s,lo))
+            setup=short_engine(s,ctx) if btc_mode=="SHORT" else long_engine(s,ctx)
+            if setup:candidates.append((float(setup["score"]),s,setup))
         except Exception as e:logging.warning("%s scoring failed: %s",s,e)
     candidates.sort(key=lambda x:x[0],reverse=True)
-    opened=0; used=set()
+
+    # Open every qualifying setup immediately, up to 40 actual open positions.
+    opened=0
     for score,s,setup in candidates:
-        if opened>=limit:break
-        if s in used or s in mine:continue
+        if opened>=free:break
         try:
             enter(s,setup["side"])
-            # enter() writes mine only after a successful protected entry.
             if s in mine:
-                opened+=1; entries_this_candle+=1; used.add(s); save()
+                opened+=1
                 logging.info("SELECTED %s %s | score %.2f | %s",setup["side"],s,score,setup["details"])
         except Exception as e:logging.warning("%s entry failed: %s",s,e)
-    logging.info("BTC CANDLE %s | CONTEXT %s | OPENED %s | CANDLE TOTAL %s/4 | OPEN %s | RISK SLOTS %s/%s",
-                 closed_candle,ctx["bias"],opened,entries_this_candle,open_position_count(),risk_position_count(),MAX_POS)
+    logging.info("BTC %s | QUALIFIED %s | OPENED %s | POSITIONS %s/%s",
+                 btc_mode,len(candidates),opened,open_position_count(),MAX_POS)
 
 def main():
     if not KEY or not SECRET:raise RuntimeError("Missing Binance demo API keys")
@@ -636,7 +594,7 @@ def main():
     ps=positions()
     for s in list(mine):
         if s not in ps:mine.pop(s,None)
-    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket Trailing: activates NET +$30, trails peak by $15 | Max 4 new entries per closed BTC 15m candle | BTC context controls NEW slots only; BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
+    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $150 | Max actual positions: 40 | SL: -30% ROI | TP: +60% ROI | Basket: NET +$20 CLOSE ALL | BTC HARD GATE: SHORT=short setups only, LONG=long setups only, WAIT=no entries | Any BTC state change closes all bot positions | After basket hit: wait for BTC to leave that state and return\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
     last=0
     while True:
         try:
