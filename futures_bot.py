@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V2.1.1-TELEGRAM-BTC-REGIME-DEMO"
+BOT_VERSION="V2.1.2-BREAKEVEN-SLOTS-MAXQTY-FIX-DEMO"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -83,6 +83,11 @@ def floor(x,step):
     return float((Decimal(str(x))/Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)*Decimal(str(step)))
 def fmt(x): return f"{x:.12f}".rstrip("0").rstrip(".")
 def qty_ok(s,x):
+    # Respect Binance MARKET_LOT_SIZE maxQty as well as step/precision.
+    # This is intentionally only an execution-safety fix; signal/risk logic is unchanged.
+    max_q=float(meta[s].get("max",0) or 0)
+    if max_q>0:
+        x=min(float(x),max_q)
     q=floor(x,meta[s]["step"])
     prec=meta[s].get("qtyPrecision",8)
     q=float(f"{q:.{prec}f}")
@@ -100,7 +105,7 @@ def exchange_info():
     for s in pub("/fapi/v1/exchangeInfo")["symbols"]:
         if s.get("quoteAsset")!="USDT" or s.get("contractType")!="PERPETUAL" or s.get("status")!="TRADING": continue
         fs={x["filterType"]:x for x in s["filters"]}; lot=fs.get("MARKET_LOT_SIZE",fs.get("LOT_SIZE",{})); pf=fs.get("PRICE_FILTER",{})
-        meta[s["symbol"]]={"step":float(lot.get("stepSize",".001")),"min":float(lot.get("minQty","0")),"tick":float(pf.get("tickSize",".0001")),"qtyPrecision":int(s.get("quantityPrecision",8))}
+        meta[s["symbol"]]={"step":float(lot.get("stepSize",".001")),"min":float(lot.get("minQty","0")),"max":float(lot.get("maxQty","0") or 0),"tick":float(pf.get("tickSize",".0001")),"qtyPrecision":int(s.get("quantityPrecision",8))}
 def positions():
     return {p["symbol"]:p for p in signed("GET","/fapi/v2/positionRisk") if abs(float(p["positionAmt"]))>0}
 def pos(s):
@@ -221,7 +226,9 @@ def close(s,p,pct,reason):
 def enter(s,d):
     if s in mine:return
     ps=positions()
-    if len(ps)>=MAX_POS or s in ps:return
+    # A bot-owned position at breakeven or better (lock_stage >= 2) no longer
+    # consumes one of the 20 RISK slots. It stays open and managed normally.
+    if risk_position_count(ps)>=MAX_POS or s in ps:return
     px=float(pub("/fapi/v1/ticker/price",{"symbol":s})["price"]); lev=leverage(s)
     qty=qty_ok(s,NOTIONAL/px)
     if qty<meta[s]["min"] or qty<=0:return
@@ -452,6 +459,25 @@ def open_position_count():
         logging.warning("open position count failed: %s",e)
         return len(mine)
 
+def risk_position_count(ps=None):
+    """Count only positions that still consume a risk slot.
+
+    Bot-owned positions whose stop has reached breakeven or better
+    (lock_stage >= 2) are excluded. Unknown/account positions remain counted
+    conservatively so this change cannot silently ignore another position.
+    """
+    try:
+        ps = ps if ps is not None else positions()
+        n=0
+        for s in ps:
+            st=mine.get(s)
+            if st is None or int(st.get("lock_stage",0)) < 2:
+                n += 1
+        return n
+    except Exception as e:
+        logging.warning("risk position count failed: %s",e)
+        return sum(1 for s,st in mine.items() if int(st.get("lock_stage",0)) < 2)
+
 def rsi_last(vals, period=14):
     x=pd.Series(vals,dtype=float); d=x.diff()
     up=d.clip(lower=0).ewm(alpha=1/period,adjust=False).mean()
@@ -556,7 +582,7 @@ def scan():
     if basket_lock_candle and closed_candle<=basket_lock_candle:return
     if closed_candle!=entry_candle:
         entry_candle=closed_candle; entries_this_candle=0; save()
-    limit=min(max(0,2-entries_this_candle),max(0,MAX_POS-open_position_count()))
+    limit=min(max(0,2-entries_this_candle),max(0,MAX_POS-risk_position_count()))
     if limit<=0:return
     candidates=[]
     for s in universe():
@@ -583,8 +609,8 @@ def scan():
                 opened+=1; entries_this_candle+=1; used.add(s); save()
                 logging.info("SELECTED %s %s | score %.2f | %s",setup["side"],s,score,setup["details"])
         except Exception as e:logging.warning("%s entry failed: %s",s,e)
-    logging.info("BTC CANDLE %s | CONTEXT %s | OPENED %s | CANDLE TOTAL %s/2 | OPEN %s/%s",
-                 closed_candle,ctx["bias"],opened,entries_this_candle,open_position_count(),MAX_POS)
+    logging.info("BTC CANDLE %s | CONTEXT %s | OPENED %s | CANDLE TOTAL %s/2 | OPEN %s | RISK SLOTS %s/%s",
+                 closed_candle,ctx["bias"],opened,entries_this_candle,open_position_count(),risk_position_count(),MAX_POS)
 
 def main():
     if not KEY or not SECRET:raise RuntimeError("Missing Binance demo API keys")
@@ -593,7 +619,7 @@ def main():
     ps=positions()
     for s in list(mine):
         if s not in ps:mine.pop(s,None)
-    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket: NET +$50 AFTER CLOSE FEES | BTC context controls NEW slots only; existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
+    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket: NET +$50 AFTER CLOSE FEES | BTC context controls NEW slots only; BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
     last=0
     while True:
         try:
