@@ -1,171 +1,409 @@
-import json
-import logging
-import math
-import os
-import time
-from datetime import datetime, timezone
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
+import os,time,hmac,hashlib,json,logging
+from decimal import Decimal,ROUND_DOWN
+from urllib.parse import urlencode
 import requests
+import pandas as pd
+import numpy as np
+
+KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
+BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
+TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
+BOT_VERSION="V2.1.1-TELEGRAM-BTC-REGIME-DEMO"
+TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
+MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
+EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
+BASKET=50.0; LOSS_LIMIT=100.0
+ALLOCATED_CAPITAL=float(os.getenv("ALLOCATED_CAPITAL","500"))
+TAKER_FEE_RATE=float(os.getenv("TAKER_FEE_RATE","0.0005"))
+S=requests.Session(); S.headers.update({"X-MBX-APIKEY":KEY})
+logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
+meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0; bot_realized=0; basket_lock_candle=0; entry_candle=0; entries_this_candle=0; basket_rearm_dir=""; basket_rearm_touched=False
+STATE="state.json"
+
+def pub(path,p=None):
+    r=S.get(BASE+path,params=p or {},timeout=15); r.raise_for_status(); return r.json()
+def signed(method,path,p=None):
+    q=dict(p or {}); q["timestamp"]=int(time.time()*1000); q["recvWindow"]=10000
+    qs=urlencode(q); sig=hmac.new(SECRET.encode(),qs.encode(),hashlib.sha256).hexdigest()
+    r=S.request(method,BASE+path+"?"+qs+"&signature="+sig,timeout=15)
+    if not r.ok: raise RuntimeError(f"{method} {path}: {r.text}")
+    return r.json()
+def balance():
+    try:
+        for x in signed("GET","/fapi/v2/balance"):
+            if x["asset"]=="USDT": return float(x["balance"])
+    except: pass
+    return 0
+def trade_rows(s,start_ms=0):
+    p={"symbol":s,"limit":1000}
+    if start_ms:p["startTime"]=int(start_ms)
+    return signed("GET","/fapi/v1/userTrades",p)
+
+def sync_realized():
+    """Book ACTUAL Binance realizedPnl and commissions for this bot's trades."""
+    global bot_realized,cycle_realized,loss_window
+    changed=False
+    for s,st in list(mine.items()):
+        try:
+            seen=set(str(x) for x in st.get("accounted_trade_ids",[]))
+            rows=trade_rows(s,st.get("entry_time",0))
+            for tr in rows:
+                tid=str(tr.get("id"))
+                if tid in seen:continue
+                # Binance userTrades: realizedPnl is exact realized profit/loss;
+                # commission is an actual cost and must be deducted.
+                delta=float(tr.get("realizedPnl",0))-float(tr.get("commission",0))
+                bot_realized+=delta
+                cycle_realized+=delta
+                loss_window+=delta
+                seen.add(tid); changed=True
+            st["accounted_trade_ids"]=list(seen)[-2000:]
+        except Exception as e:
+            logging.warning("%s PnL sync failed: %s",s,e)
+    if changed:save()
+
+def live_unrealized():
+    try:
+        ps=positions()
+        return sum(float(p.get("unRealizedProfit",0)) for s,p in ps.items() if s in mine)
+    except:
+        return 0.0
+
+def bot_balance():
+    # Virtual $500 allocation + ACTUAL realized bot PnL + current open PnL.
+    return ALLOCATED_CAPITAL + bot_realized + live_unrealized()
+
+def msg(t,bal=True):
+    if bal:t+=f"\nBot Balance: ${bot_balance():.2f}"
+    logging.info(t.replace("\n"," | "))
+    if TG and CHAT:
+        try: requests.post(f"https://api.telegram.org/bot{TG}/sendMessage",data={"chat_id":CHAT,"text":t},timeout=8)
+        except: pass
+def floor(x,step):
+    return float((Decimal(str(x))/Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)*Decimal(str(step)))
+def fmt(x): return f"{x:.12f}".rstrip("0").rstrip(".")
+def qty_ok(s,x):
+    q=floor(x,meta[s]["step"])
+    prec=meta[s].get("qtyPrecision",8)
+    q=float(f"{q:.{prec}f}")
+    return q
+def save():
+    with open(STATE,"w") as f: json.dump({"mine":mine,"pause":pause_until,"loss":loss_window,"losing":losing_cycles,"cycle":cycle_realized,"bot_realized":bot_realized,"basket_lock_candle":basket_lock_candle,"btc_mode":btc_mode,"entry_candle":entry_candle,"entries_this_candle":entries_this_candle,"basket_rearm_dir":basket_rearm_dir,"basket_rearm_touched":basket_rearm_touched},f)
+def load():
+    global mine,pause_until,loss_window,losing_cycles,cycle_realized,bot_realized,basket_lock_candle,btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched
+    try:
+        d=json.load(open(STATE)); mine=d.get("mine",{}); pause_until=d.get("pause",0); loss_window=d.get("loss",0); losing_cycles=d.get("losing",0); cycle_realized=d.get("cycle",0); bot_realized=d.get("bot_realized",0); basket_lock_candle=d.get("basket_lock_candle",0); btc_mode=d.get("btc_mode","WAIT"); entry_candle=d.get("entry_candle",0); entries_this_candle=d.get("entries_this_candle",0); basket_rearm_dir=d.get("basket_rearm_dir",""); basket_rearm_touched=d.get("basket_rearm_touched",False)
+    except: pass
+
+def exchange_info():
+    global meta
+    for s in pub("/fapi/v1/exchangeInfo")["symbols"]:
+        if s.get("quoteAsset")!="USDT" or s.get("contractType")!="PERPETUAL" or s.get("status")!="TRADING": continue
+        fs={x["filterType"]:x for x in s["filters"]}; lot=fs.get("MARKET_LOT_SIZE",fs.get("LOT_SIZE",{})); pf=fs.get("PRICE_FILTER",{})
+        meta[s["symbol"]]={"step":float(lot.get("stepSize",".001")),"min":float(lot.get("minQty","0")),"tick":float(pf.get("tickSize",".0001")),"qtyPrecision":int(s.get("quantityPrecision",8))}
+def positions():
+    return {p["symbol"]:p for p in signed("GET","/fapi/v2/positionRisk") if abs(float(p["positionAmt"]))>0}
+def pos(s):
+    for p in signed("GET","/fapi/v2/positionRisk",{"symbol":s}):
+        if abs(float(p["positionAmt"]))>0:return p
+def market(s,side,qty,reduce=False):
+    qty=qty_ok(s,qty)
+    if qty<=0: raise RuntimeError(f"{s}: quantity rounded to zero")
+    p={"symbol":s,"side":side,"type":"MARKET","quantity":fmt(qty),"newOrderRespType":"RESULT"}
+    if reduce:p["reduceOnly"]="true"
+    return signed("POST","/fapi/v1/order",p)
+def cancel_algo(s):
+    try:signed("DELETE","/fapi/v1/algoOpenOrders",{"symbol":s})
+    except:pass
+def algo_close(s,direction,order_type,px,qty=None,close_position=False):
+    side="SELL" if direction=="LONG" else "BUY"; px=floor(px,meta[s]["tick"])
+    q={"algoType":"CONDITIONAL","symbol":s,"side":side,"type":order_type,
+       "triggerPrice":fmt(px),"workingType":"MARK_PRICE","reduceOnly":"true"}
+    if close_position:
+        q.pop("reduceOnly",None); q["closePosition"]="true"
+    elif qty is not None:
+        qty=qty_ok(s,qty)
+        if qty<=0: raise RuntimeError(f"{s}: algo quantity rounded to zero")
+        q["quantity"]=fmt(qty)
+    return signed("POST","/fapi/v1/algoOrder",q)
+
+def stop(s,direction,px):
+    return algo_close(s,direction,"STOP_MARKET",px,close_position=True)
+
+def place_targets(s,direction,entry_px,lev,full_qty):
+    q1=qty_ok(s,full_qty*0.50)
+    q2=qty_ok(s,full_qty*0.25)
+    q3=qty_ok(s,max(0.0,full_qty-q1-q2))
+    tp1_move=1.00/lev
+    tp2_move=1.50/lev
+    tp3_move=2.00/lev
+    tp1=entry_px*(1+tp1_move) if direction=="LONG" else entry_px*(1-tp1_move)
+    tp2=entry_px*(1+tp2_move) if direction=="LONG" else entry_px*(1-tp2_move)
+    tp3=entry_px*(1+tp3_move) if direction=="LONG" else entry_px*(1-tp3_move)
+    if q1>0: algo_close(s,direction,"TAKE_PROFIT_MARKET",tp1,qty=q1)
+    if q2>0: algo_close(s,direction,"TAKE_PROFIT_MARKET",tp2,qty=q2)
+    if q3>0: algo_close(s,direction,"TAKE_PROFIT_MARKET",tp3,qty=q3)
+    return tp1,tp2,tp3
+def leverage(s):
+    for l in range(TARGET_LEV,0,-1):
+        try:
+            return int(signed("POST","/fapi/v1/leverage",{"symbol":s,"leverage":l})["leverage"])
+        except Exception:
+            continue
+    raise RuntimeError("No leverage available")
+def klines(s):
+    k=pub("/fapi/v1/klines",{"symbol":s,"interval":TF,"limit":110})
+    if k and int(k[-1][6])>=int(time.time()*1000):k=k[:-1]
+    return k
+def sma(values, period):
+    if not values or len(values) < period:
+        return 0.0
+    return sum(values[-period:]) / period
+
+def sig(s):
+    """BTC 15m master direction from the last CLOSED candle."""
+    k=klines(s)
+    if not k or len(k)<99:return "WAIT"
+    closes=[float(x[4]) for x in k]
+    last=closes[-1]
+    m25=sum(closes[-25:])/25
+    m99=sum(closes[-99:])/99
+    if last>m99 and last>m25:return "LONG"
+    if last<m99 and last<m25:return "SHORT"
+    return "WAIT"
+
+def btc_ma_snapshot():
+    """Last CLOSED BTC 15m candle + SMA25/SMA99."""
+    k=klines("BTCUSDT")
+    if not k or len(k)<99:return None
+    closes=[float(x[4]) for x in k]
+    row=k[-1]
+    return {
+        "candle":int(row[0]),
+        "high":float(row[2]),
+        "low":float(row[3]),
+        "close":float(row[4]),
+        "ma25":sum(closes[-25:])/25,
+        "ma99":sum(closes[-99:])/99,
+    }
+
+def universe():
+    a=[]
+    for t in pub("/fapi/v1/ticker/24hr"):
+        s=t["symbol"]
+        if s in meta and s!="BTCUSDT" and s not in EXCLUDED and float(t.get("quoteVolume",0))>=MIN_VOL:a.append((s,float(t["quoteVolume"])))
+    return [s for s,_ in sorted(a,key=lambda x:x[1],reverse=True)]
+def closed_candle_id(s="BTCUSDT"):
+    k=klines(s)
+    return int(k[-1][0]) if k else 0
+
+def estimated_exit_fees(ps):
+    # Conservative market/taker estimate for closing every remaining bot position.
+    fees=0.0
+    for s,p in ps.items():
+        if s not in mine: continue
+        qty=abs(float(p["positionAmt"]))
+        mark=float(p.get("markPrice") or p["entryPrice"])
+        fees += qty*mark*TAKER_FEE_RATE
+    return fees
+
+def roi(p):
+    amt=abs(float(p["positionAmt"])); ep=float(p["entryPrice"]); lev=float(p.get("leverage",20)); pnl=float(p["unRealizedProfit"])
+    margin=amt*ep/max(lev,1); return 100*pnl/margin if margin else 0
+def close(s,p,pct,reason):
+    global loss_window,cycle_realized,bot_realized
+    amt=abs(float(p["positionAmt"])); qty=qty_ok(s,amt*pct/100)
+    if qty<=0:return
+    market(s,"SELL" if float(p["positionAmt"])>0 else "BUY",qty,True)
+    time.sleep(.35)
+    sync_realized()
+    msg(f"{s} {reason}\nPnL booked from Binance trade history")
+def enter(s,d):
+    if s in mine:return
+    ps=positions()
+    if len(ps)>=MAX_POS or s in ps:return
+    px=float(pub("/fapi/v1/ticker/price",{"symbol":s})["price"]); lev=leverage(s)
+    qty=qty_ok(s,NOTIONAL/px)
+    if qty<meta[s]["min"] or qty<=0:return
+    market(s,"BUY" if d=="LONG" else "SELL",qty); time.sleep(.25); p=pos(s)
+    if not p:return
+    ep=float(p["entryPrice"]); adverse=.50/lev
+    sp=ep*(1-adverse) if d=="LONG" else ep*(1+adverse)
+    cancel_algo(s)
+    stop(s,d,sp)
+    # V2.1: keep ONE exchange-side protective STOP only. Profit targets are managed
+    # by manage() from live leveraged ROI. This prevents -4045 max algo/stop-order saturation.
+    mine[s]={"dir":d,"tp1":False,"tp2":False,"lock_stage":0,
+             "initial_qty":abs(float(p["positionAmt"])),"entry_time":int(time.time()*1000)-10000,
+             "accounted_trade_ids":[]}; save()
+    sync_realized()
+    msg(f"OPEN {d} {s}\nNotional: $300 | Leverage: {lev}x\nEntry: {ep}\nProfit Lock: +30->SL -25 | +50->BE | +75->SL +25 | TP1 +100% (50%, SL +50) | TP2 +150% (25%, SL +100) | TP3 +200% final")
+def close_all(reason):
+    global cycle_realized,losing_cycles,pause_until,basket_lock_candle,basket_rearm_dir,basket_rearm_touched
+    ps=positions(); targets=[(s,p) for s,p in ps.items() if s in mine]
+    cycle_total=cycle_realized+sum(float(p["unRealizedProfit"]) for _,p in targets)
+
+    # Cancel protection first, then retry market close up to 3 times.
+    for s,_ in targets:
+        cancel_algo(s)
+
+    failed=[]
+    for s,_ in targets:
+        ok=False
+        for attempt in range(1,4):
+            try:
+                live=pos(s)
+                if not live:
+                    ok=True; break
+                close(s,live,100,reason)
+                time.sleep(.35)
+                if not pos(s):
+                    ok=True; break
+            except Exception as e:
+                logging.error("%s close attempt %d/3: %s",s,attempt,e)
+                time.sleep(1.0)
+        if not ok:
+            failed.append(s)
+
+    # Re-check exchange state. Never pretend basket is finished while a bot position remains.
+    live_ps=positions()
+    still_open=[s for s in mine if s in live_ps]
+    if still_open:
+        msg("BASKET CLOSE INCOMPLETE | still open: "+", ".join(still_open))
+        # Restore a protective SL for any remaining position where possible.
+        for s in still_open:
+            try:
+                lp=live_ps[s]
+                d="LONG" if float(lp["positionAmt"])>0 else "SHORT"
+                ep=float(lp["entryPrice"]); lev=float(lp.get("leverage",20))
+                adverse=.50/max(lev,1)
+                sp=ep*(1-adverse) if d=="LONG" else ep*(1+adverse)
+                stop(s,d,sp)
+            except Exception as e:
+                logging.error("%s restore stop: %s",s,e)
+        save()
+        return False
+
+    if cycle_total<0: losing_cycles+=1
+    else: losing_cycles=0
+    if losing_cycles>=3:
+        pause_until=max(pause_until,time.time()+3600); losing_cycles=0; msg("3 losing cycles -> PAUSE 1 HOUR")
+
+    mine.clear(); cycle_realized=0
+    basket_lock_candle=closed_candle_id("BTCUSDT")
+
+    # V2: BTC is context only, never a hard direction gate.
+    # Keep the existing one-closed-candle basket lock; disable MA25 directional re-arm.
+    if reason=="BASKET NET +$50":
+        basket_rearm_dir=""
+        basket_rearm_touched=False
+        msg("BASKET +$50 CLOSED | next cycle waits for the next closed BTC 15m candle")
+    save()
+    return True
+
+def protected_stop_for_roi(s,p,d,target_roi):
+    """Replace the single exchange-side STOP so a retrace locks target leveraged ROI."""
+    ep=float(p["entryPrice"]); lev=float(p.get("leverage",20))
+    move=(float(target_roi)/100.0)/max(lev,1.0)
+    sp=ep*(1+move) if d=="LONG" else ep*(1-move)
+    cancel_algo(s)
+    stop(s,d,sp)
+    return sp
+
+def manage():
+    global pause_until,loss_window
+    sync_realized()
+    ps=positions()
+    for s in list(mine):
+        if s not in ps:
+            sync_realized()
+            mine.pop(s,None); save()
+            msg(f"{s} CLOSED ON EXCHANGE | Actual PnL reconciled")
+    gross_total=cycle_realized+sum(float(p["unRealizedProfit"]) for s,p in ps.items() if s in mine)
+    expected_close_fees=estimated_exit_fees(ps)
+    net_after_close=gross_total-expected_close_fees
+    if mine and net_after_close>=BASKET:
+        msg(f"BASKET NET TARGET ${net_after_close:.2f} AFTER EST. CLOSE FEES -> CLOSE ALL")
+        close_all("BASKET NET +$50")
+        return
+
+    for s in list(mine):
+        p=ps.get(s)
+        if not p: continue
+        d="LONG" if float(p["positionAmt"])>0 else "SHORT"
+        r=roi(p)
+        st=int(mine[s].get("lock_stage",0))
+        initial_qty=float(mine[s].get("initial_qty",abs(float(p["positionAmt"]))))
+
+        try:
+            # Stair-step profit protection. Stages only move forward; never loosen a stop.
+            if r>=200 and st<6:
+                cancel_algo(s)
+                close(s,p,100,"TP3 +200% ROI FINAL")
+                mine[s]["lock_stage"]=6; save()
+                continue
+            if r>=150 and st<5:
+                # Close 25% of ORIGINAL size (normally 50% of the remaining half).
+                live_qty=abs(float(p["positionAmt"]))
+                q_pct=min(100.0,100.0*(initial_qty*0.25)/max(live_qty,1e-12))
+                cancel_algo(s); close(s,p,q_pct,"TP2 +150% ROI (25% ORIGINAL)")
+                time.sleep(.25); lp=pos(s)
+                if lp: protected_stop_for_roi(s,lp,d,100)
+                mine[s]["tp2"]=True; mine[s]["lock_stage"]=5; save()
+                msg(f"{s} PROFIT LOCK | TP2 DONE | Remaining SL -> +100% ROI")
+                continue
+            if r>=100 and st<4:
+                cancel_algo(s); close(s,p,50,"TP1 +100% ROI (50%)")
+                time.sleep(.25); lp=pos(s)
+                if lp: protected_stop_for_roi(s,lp,d,50)
+                mine[s]["tp1"]=True; mine[s]["lock_stage"]=4; save()
+                msg(f"{s} PROFIT LOCK | TP1 DONE | Remaining SL -> +50% ROI")
+                continue
+            if r>=75 and st<3:
+                protected_stop_for_roi(s,p,d,25)
+                mine[s]["lock_stage"]=3; save()
+                msg(f"{s} PROFIT LOCK | ROI +75% -> SL +25% ROI")
+                continue
+            if r>=50 and st<2:
+                protected_stop_for_roi(s,p,d,0)
+                mine[s]["lock_stage"]=2; save()
+                msg(f"{s} PROFIT LOCK | ROI +50% -> SL BREAKEVEN")
+                continue
+            if r>=30 and st<1:
+                protected_stop_for_roi(s,p,d,-25)
+                mine[s]["lock_stage"]=1; save()
+                msg(f"{s} PROFIT LOCK | ROI +30% -> SL -25% ROI")
+                continue
+        except Exception as e:
+            logging.warning("%s profit-lock management failed: %s",s,e)
+            # Best effort: if stop replacement/partial close failed, do not advance stage.
+
+    if loss_window<=-LOSS_LIMIT and time.time()>=pause_until:
+        pause_until=time.time()+10800; loss_window=0; save(); msg("Loss window reached -$100 -> PAUSE 3 HOURS")
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("mosab-bots")
 
+# --- Exact Liquidity Reversal Staged signal reused from prior bot ---
+def liq_ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
-def env(name, default, cast=str):
-    value = os.getenv(name, default)
-    if cast is bool:
-        return str(value).lower() in {"1", "true", "yes", "on"}
-    return cast(value)
+def liq_sma(s, n): return s.rolling(n).mean()
 
-
-BOT_TYPE = "AMD_PO3_ORIGINAL"
-BOT_NAME = env("BOT_NAME", "AMD Po3 Original")
-START_BALANCE = env("START_BALANCE", 500, float)
-LEVERAGE = env("LEVERAGE", 20, int)
-NOTIONAL = env("POSITION_NOTIONAL", 200, float)
-MAX_POSITIONS = env("MAX_POSITIONS", 20, int)
-MAX_TOTAL_POSITIONS = env("MAX_TOTAL_POSITIONS", 50, int)
-DRY_RUN = env("DRY_RUN", True, bool)
-TIMEFRAME = env("TIMEFRAME", "5m")
-SCAN_SECONDS = env("SCAN_SECONDS", 300, int)
-CHECK_SECONDS = env("CHECK_SECONDS", 10, int)
-TOP_N = env("TOP_N", 40, int)
-MIN_QUOTE_VOLUME = env("MIN_QUOTE_VOLUME", 20_000_000, float)
-BASE_URL = env("EXCHANGE_BASE_URL", "https://fapi.binance.com").rstrip("/")
-STATE_DIR = Path(env("STATE_DIR", "/data"))
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TG_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TG_CHAT_ID", "")
-FEE_RATE = env("FEE_RATE", 0.0005, float)
-
-
-class Market:
-    def __init__(self):
-        self.s = requests.Session()
-        self.s.headers.update({"User-Agent": "MosabPaperBots/1.0"})
-
-    def get(self, path, params=None):
-        response = self.s.get(BASE_URL + path, params=params, timeout=20)
-        response.raise_for_status()
-        return response.json()
-
-    def symbols(self):
-        info = self.get("/fapi/v1/exchangeInfo")
-        allowed = {
-            x["symbol"] for x in info["symbols"]
-            if x.get("status") == "TRADING"
-            and x.get("quoteAsset") == "USDT"
-            and x.get("contractType") == "PERPETUAL"
-        }
-        rows = self.get("/fapi/v1/ticker/24hr")
-        ranked = sorted(
-            (x for x in rows if x["symbol"] in allowed and float(x.get("quoteVolume", 0)) >= MIN_QUOTE_VOLUME),
-            key=lambda x: float(x["quoteVolume"]), reverse=True,
-        )
-        return [x["symbol"] for x in ranked[:TOP_N]]
-
-    def candles(self, symbol, interval=TIMEFRAME, limit=260):
-        rows = self.get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-        cols = ["open_time", "open", "high", "low", "close", "volume", "close_time", "qv", "n", "tb", "tq", "ignore"]
-        df = pd.DataFrame(rows, columns=cols)
-        for c in ["open", "high", "low", "close", "volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        # Never generate a signal from the currently forming candle.
-        return df.iloc[:-1].reset_index(drop=True)
-
-    def prices(self):
-        return {x["symbol"]: float(x["price"]) for x in self.get("/fapi/v1/ticker/price")}
-
-
-def ema(s, n): return s.ewm(span=n, adjust=False).mean()
-def sma(s, n): return s.rolling(n).mean()
-
-
-def atr(df, n=14):
+def liq_atr(df, n=14):
     pc = df.close.shift(1)
     tr = pd.concat([(df.high-df.low), (df.high-pc).abs(), (df.low-pc).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/n, adjust=False).mean()
 
-
-def rsi(s, n=14):
+def liq_rsi(s, n=14):
     d = s.diff()
     up = d.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
     dn = (-d.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
     return 100 - 100 / (1 + up / dn.replace(0, np.nan))
 
-
-def supertrend(df, n=10, mult=3.0):
-    a = atr(df, n)
-    hl2 = (df.high + df.low) / 2
-    lower, upper = hl2 - mult*a, hl2 + mult*a
-    fl, fu = lower.copy(), upper.copy()
-    direction = pd.Series(1, index=df.index, dtype=int)
-    for i in range(1, len(df)):
-        fl.iat[i] = max(lower.iat[i], fl.iat[i-1]) if df.close.iat[i-1] > fl.iat[i-1] else lower.iat[i]
-        fu.iat[i] = min(upper.iat[i], fu.iat[i-1]) if df.close.iat[i-1] < fu.iat[i-1] else upper.iat[i]
-        if direction.iat[i-1] == -1 and df.close.iat[i] > fu.iat[i-1]: direction.iat[i] = 1
-        elif direction.iat[i-1] == 1 and df.close.iat[i] < fl.iat[i-1]: direction.iat[i] = -1
-        else: direction.iat[i] = direction.iat[i-1]
-    line = pd.Series(np.where(direction == 1, fl, fu), index=df.index)
-    return direction, line
-
-
-def linreg_momentum(df, n=20):
-    center = ((df.high.rolling(n).max()+df.low.rolling(n).min())/2 + sma(df.close, n))/2
-    raw = df.close-center
-    x = np.arange(n)
-    return raw.rolling(n).apply(lambda y: np.polyfit(x, y, 1)[0]*(n-1)+np.polyfit(x, y, 1)[1], raw=True)
-
-
-def squeeze(df, n=20, bb_mult=2.0, kc_mult=1.5):
-    basis, dev = sma(df.close, n), bb_mult*df.close.rolling(n).std(ddof=0)
-    bb_u, bb_l = basis+dev, basis-dev
-    kma, kr = sma(df.close, n), sma(pd.concat([(df.high-df.low), (df.high-df.close.shift()).abs(), (df.low-df.close.shift()).abs()], axis=1).max(axis=1), n)
-    kc_u, kc_l = kma+kc_mult*kr, kma-kc_mult*kr
-    on = (bb_l > kc_l) & (bb_u < kc_u)
-    off = (bb_l < kc_l) & (bb_u > kc_u)
-    return on, off, linreg_momentum(df, n)
-
-
-def session_vwap(df):
-    day = pd.to_datetime(df.open_time, unit="ms", utc=True).dt.date
-    typical = (df.high+df.low+df.close)/3
-    return (typical*df.volume).groupby(day).cumsum()/df.volume.groupby(day).cumsum().replace(0, np.nan)
-
-
-def fee_adjusted_three_loss_target(entry, stop, side):
-    """Target whose net profit equals three net stop losses, including fees."""
-    f = FEE_RATE
-    if side == "LONG":
-        net_loss_per_qty = (entry-stop)+f*(entry+stop)
-        return (entry*(1+f)+3*net_loss_per_qty)/(1-f)
-    net_loss_per_qty = (stop-entry)+f*(entry+stop)
-    return (entry*(1-f)-3*net_loss_per_qty)/(1+f)
-
-
-def trend_signal(df, htf):
-    on, off, mom = squeeze(df)
-    st_dir, st_line = supertrend(df)
-    macd = ema(htf.close, 12)-ema(htf.close, 26)
-    sig = sma(macd, 9)
-    hist = macd-sig
-    release = bool(on.iat[-2] and off.iat[-1])
-    if not release: return None
-    if mom.iat[-1] > 0 and mom.iat[-1] > mom.iat[-2] and hist.iat[-1] > 0 and st_dir.iat[-1] == 1:
-        return {"side":"LONG", "stop":float(st_line.iat[-1]), "target":float(df.close.iat[-1]+3*atr(df).iat[-1]), "tag":"SQZ+MACD_MTF+ST"}
-    if mom.iat[-1] < 0 and mom.iat[-1] < mom.iat[-2] and hist.iat[-1] < 0 and st_dir.iat[-1] == -1:
-        return {"side":"SHORT", "stop":float(st_line.iat[-1]), "target":float(df.close.iat[-1]-3*atr(df).iat[-1]), "tag":"SQZ+MACD_MTF+ST"}
-    return None
-
-
-def liquidity_signal(df):
-    basis = ema(df.close, 55)
-    a55 = atr(df, 55)
+def liq_liquidity_signal(df):
+    basis = liq_ema(df.close, 55)
+    a55 = liq_atr(df, 55)
     upper, lower = basis+4*a55, basis-4*a55
-    a14 = atr(df, 14)
+    a14 = liq_atr(df, 14)
     recent = slice(-11, -1)
     lower_trap = bool((df.close.iloc[recent] < lower.iloc[recent]).any() and df.close.iat[-1] > lower.iat[-1])
     upper_trap = bool((df.close.iloc[recent] > upper.iloc[recent]).any() and df.close.iat[-1] < upper.iat[-1])
@@ -175,7 +413,7 @@ def liquidity_signal(df):
     compressed = width/max(float(a55.iat[-2]), 1e-12) <= 8.0
     bull_po3 = compressed and df.low.iat[-1] < rl and df.close.iat[-1] > rl
     bear_po3 = compressed and df.high.iat[-1] > rh and df.close.iat[-1] < rh
-    rv = rsi(df.close, 20).iat[-1]
+    rv = liq_rsi(df.close, 20).iat[-1]
     if (lower_trap or bull_po3) and rv < 55:
         stop = min(df.low.iloc[-2:].min(), rl)-0.5*a14.iat[-1]
         target = max(basis.iat[-1], rh)
@@ -186,424 +424,182 @@ def liquidity_signal(df):
         return {"side":"SHORT", "stop":float(stop), "target":float(target), "tag":"TRAP/PO3+RSI"}
     return None
 
+def liq_df(s):
+    k=klines(s)
+    if not k or len(k)<100:return None
+    # klines() already excludes the forming candle in this bot.
+    return pd.DataFrame({
+        "open":[float(x[1]) for x in k],
+        "high":[float(x[2]) for x in k],
+        "low":[float(x[3]) for x in k],
+        "close":[float(x[4]) for x in k],
+        "volume":[float(x[5]) for x in k],
+    })
 
-def amd_po3_signal(df):
-    """Confirmed-bar AMD cycle: compression -> sweep -> return -> distribution."""
-    if len(df) < 240:
+def liquidity_entry_signal(s):
+    df=liq_df(s)
+    if df is None:return None
+    try:
+        return liq_liquidity_signal(df)
+    except Exception as e:
+        logging.warning("%s liquidity signal: %s",s,e)
         return None
 
-    min_range_bars, max_range_bars = 12, 96
-    range_win, stat_window = 20, 200
-    compression_pct, tolerance = 25.0, 0.10
-    min_width_pct, return_bars = 0.15, 8
-    stop_atr_buffer, fib_extension = 0.40, 1.50
-    distribution_timeout, cooldown_bars = 64, 10
+def open_position_count():
+    try:
+        return sum(1 for p in signed("GET","/fapi/v2/positionRisk") if abs(float(p.get("positionAmt",0)))>0)
+    except Exception as e:
+        logging.warning("open position count failed: %s",e)
+        return len(mine)
 
-    a14 = atr(df, 14)
-    hi20 = df.high.rolling(range_win).max()
-    lo20 = df.low.rolling(range_win).min()
-    widths = hi20-lo20
-    width_rank = widths.rolling(stat_window).apply(
-        lambda values: 100.0*np.count_nonzero(values <= values[-1])/len(values), raw=True
-    )
+def rsi_last(vals, period=14):
+    x=pd.Series(vals,dtype=float); d=x.diff()
+    up=d.clip(lower=0).ewm(alpha=1/period,adjust=False).mean()
+    dn=(-d.clip(upper=0)).ewm(alpha=1/period,adjust=False).mean()
+    rs=up/dn.replace(0,np.nan); z=100-(100/(1+rs))
+    return float(z.iloc[-1]) if len(z) and pd.notna(z.iloc[-1]) else 50.0
 
-    # Pivots are consumed only after three right-hand bars have closed.
-    pivot_lr = 3
-    pivot_high = np.full(len(df), np.nan)
-    pivot_low = np.full(len(df), np.nan)
-    for j in range(pivot_lr, len(df)-pivot_lr):
-        hs = df.high.iloc[j-pivot_lr:j+pivot_lr+1]
-        ls = df.low.iloc[j-pivot_lr:j+pivot_lr+1]
-        if df.high.iat[j] >= hs.max(): pivot_high[j] = df.high.iat[j]
-        if df.low.iat[j] <= ls.min(): pivot_low[j] = df.low.iat[j]
+def btc_context():
+    """BTC flow is a SMALL scoring input only. It cannot block either side."""
+    k=klines("BTCUSDT")
+    if not k or len(k)<100:return {"bias":"NEUTRAL","long_bonus":0.0,"short_bonus":0.0,"score":0.0}
+    c=np.array([float(x[4]) for x in k]); h=np.array([float(x[2]) for x in k])
+    l=np.array([float(x[3]) for x in k]); v=np.array([float(x[5]) for x in k])
+    tb=np.array([float(x[9]) for x in k])
+    e25=float(pd.Series(c).ewm(span=25,adjust=False).mean().iloc[-1])
+    e99=float(pd.Series(c).ewm(span=99,adjust=False).mean().iloc[-1])
+    tp=(h+l+c)/3; vv=v[-20:]
+    vwap=float(np.sum(tp[-20:]*vv)/max(np.sum(vv),1e-12))
+    buy=float(np.sum(tb[-3:])/max(np.sum(v[-3:]),1e-12))
+    vr=float(v[-1]/max(np.mean(v[-20:]),1e-12))
+    score=(2.5 if c[-1]>vwap else -2.5)+(2 if e25>e99 else -2)
+    score+=max(-3,min(3,(buy-.5)*20))
+    if vr>1.2:score+=1.5 if c[-1]>c[-2] else -1.5
+    bias="LONG" if score>=2.5 else "SHORT" if score<=-2.5 else "NEUTRAL"
+    bonus=max(-8,min(8,score))
+    return {"bias":bias,"long_bonus":bonus,"short_bonus":-bonus,"score":score,
+            "buy_ratio":buy,"vol_ratio":vr,"close":float(c[-1]),"vwap":vwap}
 
-    state, cooldown_until = "IDLE", -1
-    range_start = range_high = range_low = range_width = atr_anchor = None
-    sweep_side = sweep_bar = sweep_extreme = None
-    dist_bar = dist_dir = entry = stop = target = None
+def long_engine(s,btc):
+    """Dedicated LONG: trend/reclaim + CHOCH/retest + volume/aggression."""
+    k=klines(s)
+    if not k or len(k)<100:return None
+    o=np.array([float(x[1]) for x in k]); h=np.array([float(x[2]) for x in k])
+    l=np.array([float(x[3]) for x in k]); c=np.array([float(x[4]) for x in k])
+    v=np.array([float(x[5]) for x in k]); tb=np.array([float(x[9]) for x in k])
+    e21=float(pd.Series(c).ewm(span=21,adjust=False).mean().iloc[-1])
+    e55=float(pd.Series(c).ewm(span=55,adjust=False).mean().iloc[-1])
+    tp=(h+l+c)/3; vwap=float(np.sum(tp[-20:]*v[-20:])/max(np.sum(v[-20:]),1e-12))
+    r=rsi_last(c); vr=float(v[-1]/max(np.mean(v[-20:]),1e-12))
+    buy=float(np.sum(tb[-3:])/max(np.sum(v[-3:]),1e-12))
+    prior_high=float(np.max(h[-12:-2]))
+    choch=c[-1]>prior_high or (c[-1]>e21 and c[-2]<=e21)
+    retest=l[-1]<=max(e21,vwap)*1.003 and c[-1]>max(e21,vwap)
+    trend=e21>e55 and c[-1]>e21
+    reclaim=c[-1]>vwap and c[-2]<=vwap
+    impulse=c[-1]>o[-1] and vr>=1.05
+    score=0.0
+    if trend:score+=24
+    if c[-1]>vwap:score+=14
+    if choch:score+=18
+    if retest or reclaim:score+=14
+    if 48<=r<=72:score+=10
+    if buy>=.52:score+=10
+    if impulse:score+=10
+    score+=float(btc.get("long_bonus",0))
+    if not (score>=70 and (choch or retest or reclaim) and (trend or c[-1]>vwap)):return None
+    return {"side":"LONG","score":round(score,2),"tag":"LONG_TREND+VWAP+CHOCH+FLOW",
+            "details":f"rsi={r:.1f} vol={vr:.2f} buy={buy:.2f}"}
 
-    for i in range(stat_window+range_win-2, len(df)):
-        close_i, high_i, low_i = float(df.close.iat[i]), float(df.high.iat[i]), float(df.low.iat[i])
+def short_engine(s,btc):
+    """Preserve original Liquidity Reversal SHORT trigger; add quality ranking."""
+    ls=liquidity_entry_signal(s)
+    if not ls or ls.get("side")!="SHORT":return None
+    k=klines(s)
+    if not k or len(k)<100:return None
+    o=np.array([float(x[1]) for x in k]); h=np.array([float(x[2]) for x in k])
+    l=np.array([float(x[3]) for x in k]); c=np.array([float(x[4]) for x in k])
+    v=np.array([float(x[5]) for x in k]); tb=np.array([float(x[9]) for x in k])
+    e21=float(pd.Series(c).ewm(span=21,adjust=False).mean().iloc[-1])
+    r=rsi_last(c); vr=float(v[-1]/max(np.mean(v[-20:]),1e-12))
+    buy=float(np.sum(tb[-3:])/max(np.sum(v[-3:]),1e-12))
+    breakdown=c[-1]<e21 or c[-1]<l[-2]
+    rejection=h[-1]>h[-2] and c[-1]<o[-1]
+    score=62.0
+    if breakdown:score+=12
+    if rejection:score+=8
+    if r<58:score+=6
+    if buy<=.48:score+=8
+    if vr>=1.05 and c[-1]<o[-1]:score+=6
+    score+=float(btc.get("short_bonus",0))
+    if score<70:return None
+    return {"side":"SHORT","score":round(score,2),"tag":"SHORT_LIQUIDITY_REVERSAL+QUALITY",
+            "details":f"rsi={r:.1f} vol={vr:.2f} buy={buy:.2f}"}
 
-        if state == "IDLE":
-            if i < cooldown_until or pd.isna(width_rank.iat[i]) or width_rank.iat[i] > compression_pct:
-                continue
-            candidate_width = float(widths.iat[i])
-            if candidate_width < min_width_pct/100.0*close_i:
-                continue
-            candidate_start = i-range_win+1
-            confirmed_end = i-pivot_lr
-            ph = pivot_high[candidate_start:confirmed_end+1]
-            pl = pivot_low[candidate_start:confirmed_end+1]
-            range_high = float(np.nanmax(ph)) if np.isfinite(ph).any() else float(hi20.iat[i])
-            range_low = float(np.nanmin(pl)) if np.isfinite(pl).any() else float(lo20.iat[i])
-            range_width = range_high-range_low
-            if range_width < min_width_pct/100.0*close_i:
-                continue
-            range_start = candidate_start
-            anchor_index = max(0, candidate_start-1)
-            atr_anchor = float(a14.iat[anchor_index])
-            if not math.isfinite(atr_anchor) or atr_anchor <= 0:
-                atr_anchor = float(a14.iat[i])
-            state = "ACCUM"
-            continue
+def scan():
+    global btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched,basket_lock_candle
+    if time.time()<pause_until:return
+    closed_candle=closed_candle_id("BTCUSDT")
+    if not closed_candle:return
+    ctx=btc_context()
+    old_mode=btc_mode
+    btc_mode=ctx["bias"]
+    logging.info("BTC CONTEXT: %s | score %.2f | taker-buy %.3f | vol %.2f | NOT A HARD GATE",
+                 ctx["bias"],ctx["score"],ctx.get("buy_ratio",.5),ctx.get("vol_ratio",1))
+    # Telegram only when the BTC market state changes; never spam every scan.
+    if btc_mode != old_mode:
+        direction_text = ("New positions: LONG only" if btc_mode=="LONG" else
+                          "New positions: SHORT only" if btc_mode=="SHORT" else
+                          "New positions: LONG or SHORT by setup score")
+        msg(f"BTC MARKET CHANGE: {old_mode} -> {btc_mode}\n{direction_text}\nExisting positions continue with Profit Lock / SL / TP", bal=False)
+        save()
+    if basket_lock_candle and closed_candle<=basket_lock_candle:return
+    if closed_candle!=entry_candle:
+        entry_candle=closed_candle; entries_this_candle=0; save()
+    limit=min(max(0,2-entries_this_candle),max(0,MAX_POS-open_position_count()))
+    if limit<=0:return
+    candidates=[]
+    for s in universe():
+        if s in mine:continue
+        try:
+            # V2.1: market direction controls NEW slots only. Existing positions are never
+            # force-closed on a BTC context flip; they keep their own SL/TP management.
+            if ctx["bias"] in ("SHORT","NEUTRAL"):
+                sh=short_engine(s,ctx)
+                if sh:candidates.append((float(sh["score"]),s,sh))
+            if ctx["bias"] in ("LONG","NEUTRAL"):
+                lo=long_engine(s,ctx)
+                if lo:candidates.append((float(lo["score"]),s,lo))
+        except Exception as e:logging.warning("%s scoring failed: %s",s,e)
+    candidates.sort(key=lambda x:x[0],reverse=True)
+    opened=0; used=set()
+    for score,s,setup in candidates:
+        if opened>=limit:break
+        if s in used or s in mine:continue
+        try:
+            enter(s,setup["side"])
+            # enter() writes mine only after a successful protected entry.
+            if s in mine:
+                opened+=1; entries_this_candle+=1; used.add(s); save()
+                logging.info("SELECTED %s %s | score %.2f | %s",setup["side"],s,score,setup["details"])
+        except Exception as e:logging.warning("%s entry failed: %s",s,e)
+    logging.info("BTC CANDLE %s | CONTEXT %s | OPENED %s | CANDLE TOTAL %s/2 | OPEN %s/%s",
+                 closed_candle,ctx["bias"],opened,entries_this_candle,open_position_count(),MAX_POS)
 
-        if state == "ACCUM":
-            age = i-range_start
-            if age > max_range_bars:
-                state, cooldown_until = "IDLE", i+cooldown_bars
-                continue
-            tol = tolerance*range_width
-            breach_high = high_i > range_high+tol
-            breach_low = low_i < range_low-tol
-            if age < min_range_bars:
-                if breach_high or breach_low:
-                    state, cooldown_until = "IDLE", i+cooldown_bars
-                continue
-            if breach_high and breach_low:
-                state, cooldown_until = "IDLE", i+cooldown_bars
-                continue
-            if breach_high or breach_low:
-                sweep_side = 1 if breach_high else -1
-                sweep_bar = i
-                sweep_extreme = high_i if breach_high else low_i
-                state = "SWEEP"
-            else:
-                continue
-
-        if state == "SWEEP":
-            sweep_extreme = max(sweep_extreme, high_i) if sweep_side == 1 else min(sweep_extreme, low_i)
-            if i-sweep_bar > return_bars:
-                state, cooldown_until = "IDLE", i+cooldown_bars
-                continue
-            if not (range_low <= close_i <= range_high):
-                continue
-
-            dist_dir = -1 if sweep_side == 1 else 1
-            entry, dist_bar = close_i, i
-            if dist_dir == 1:
-                fib_leg = range_high-sweep_extreme
-                stop = sweep_extreme-stop_atr_buffer*atr_anchor
-                target = range_high+(fib_extension-1.0)*fib_leg
-                side = "LONG"
-            else:
-                fib_leg = sweep_extreme-range_low
-                stop = sweep_extreme+stop_atr_buffer*atr_anchor
-                target = range_low-(fib_extension-1.0)*fib_leg
-                side = "SHORT"
-            if fib_leg <= 0 or not (stop < entry < target if side == "LONG" else target < entry < stop):
-                state, cooldown_until = "IDLE", i+cooldown_bars
-                continue
-            if i == len(df)-1:
-                return {"side":side, "stop":float(stop), "target":float(target), "tag":"AMD_PO3_SWEEP_RETURN"}
-            state = "DIST"
-            continue
-
-        if state == "DIST":
-            hit_target = high_i >= target if dist_dir == 1 else low_i <= target
-            hit_stop = low_i <= stop if dist_dir == 1 else high_i >= stop
-            if hit_target or hit_stop or i-dist_bar >= distribution_timeout:
-                state, cooldown_until = "IDLE", i+cooldown_bars
-
-    return None
-
-
-def intraday_signal(df):
-    e9, e21, mid = ema(df.close, 9), ema(df.close, 21), sma(df.close, 20)
-    vw, a = session_vwap(df), atr(df, 14)
-    st_dir, _ = supertrend(df)
-    cross_up = e9.iat[-2] <= mid.iat[-2] and e9.iat[-1] > mid.iat[-1]
-    cross_dn = e9.iat[-2] >= mid.iat[-2] and e9.iat[-1] < mid.iat[-1]
-    if cross_up and df.close.iat[-1] > e21.iat[-1] and df.close.iat[-1] > vw.iat[-1] and st_dir.iat[-1] == 1:
-        return {"side":"LONG", "stop":float(df.close.iat[-1]-1.5*a.iat[-1]), "target":float(df.close.iat[-1]+2*a.iat[-1]), "tag":"EMA/BB+VWAP"}
-    if cross_dn and df.close.iat[-1] < e21.iat[-1] and df.close.iat[-1] < vw.iat[-1] and st_dir.iat[-1] == -1:
-        return {"side":"SHORT", "stop":float(df.close.iat[-1]+1.5*a.iat[-1]), "target":float(df.close.iat[-1]-2*a.iat[-1]), "tag":"EMA/BB+VWAP"}
-    # Range-mode ChartArt reversal, only when SuperTrend has flipped repeatedly.
-    flips = int((st_dir.iloc[-12:].diff().fillna(0) != 0).sum())
-    bb_basis, bb_dev = sma(df.close, 200), 2*df.close.rolling(200).std(ddof=0)
-    bb_u, bb_l, rv = bb_basis+bb_dev, bb_basis-bb_dev, rsi(df.close, 6)
-    if flips >= 2 and df.close.iat[-2] < bb_l.iat[-2] and df.close.iat[-1] > bb_l.iat[-1] and rv.iat[-2] <= 50 < rv.iat[-1]:
-        return {"side":"LONG", "stop":float(df.close.iat[-1]-1.5*a.iat[-1]), "target":float(bb_basis.iat[-1]), "tag":"BB200+RSI6_RANGE"}
-    if flips >= 2 and df.close.iat[-2] > bb_u.iat[-2] and df.close.iat[-1] < bb_u.iat[-1] and rv.iat[-2] >= 50 > rv.iat[-1]:
-        return {"side":"SHORT", "stop":float(df.close.iat[-1]+1.5*a.iat[-1]), "target":float(bb_basis.iat[-1]), "tag":"BB200+RSI6_RANGE"}
-    return None
-
-
-def cocktail_signal(df, htf):
-    """Adaptive, non-conflicting blend of the ten submitted strategies."""
-    close = float(df.close.iat[-1])
-    a = atr(df, 14)
-    st_dir, _ = supertrend(df)
-    e9, e21, s200 = ema(df.close, 9), ema(df.close, 21), sma(df.close, 200)
-    vw = session_vwap(df)
-    on, off, mom = squeeze(df)
-    release = bool(on.iat[-2] and off.iat[-1])
-    cross_up = e9.iat[-2] <= e21.iat[-2] and e9.iat[-1] > e21.iat[-1]
-    cross_dn = e9.iat[-2] >= e21.iat[-2] and e9.iat[-1] < e21.iat[-1]
-    macd = ema(htf.close, 12)-ema(htf.close, 26)
-    hist = macd-sma(macd, 9)
-    flips = int((st_dir.iloc[-12:].diff().fillna(0) != 0).sum())
-    trend_strength = abs(e9.iat[-1]-e21.iat[-1])/max(float(a.iat[-1]), 1e-12)
-    trending = flips <= 1 and trend_strength >= 0.25
-
-    # Trend/expansion route: Squeeze or EMA trigger, with independent direction,
-    # momentum, value and structure confirmations. No reversal input is mixed in.
-    if trending and (release or cross_up or cross_dn):
-        prev_high = float(df.high.iloc[-21:-1].max())
-        prev_low = float(df.low.iloc[-21:-1].min())
-        long_checks = [st_dir.iat[-1] == 1, close > s200.iat[-1], hist.iat[-1] > 0,
-                       close > vw.iat[-1], mom.iat[-1] > 0 and mom.iat[-1] > mom.iat[-2],
-                       close > prev_high]
-        short_checks = [st_dir.iat[-1] == -1, close < s200.iat[-1], hist.iat[-1] < 0,
-                        close < vw.iat[-1], mom.iat[-1] < 0 and mom.iat[-1] < mom.iat[-2],
-                        close < prev_low]
-        long_score, short_score = sum(long_checks), sum(short_checks)
-        if (release or cross_up) and long_score >= 5 and long_score > short_score:
-            return {"side":"LONG", "stop":close*(1-0.50/LEVERAGE), "target":close*(1+2.0/LEVERAGE), "tag":f"COCKTAIL_TREND_{long_score}/6"}
-        if (release or cross_dn) and short_score >= 5 and short_score > long_score:
-            return {"side":"SHORT", "stop":close*(1+0.50/LEVERAGE), "target":close*(1-2.0/LEVERAGE), "tag":f"COCKTAIL_TREND_{short_score}/6"}
-
-    # Range/liquidity route: only active when the trend route is inactive.
-    basis, a55 = ema(df.close, 55), atr(df, 55)
-    upper, lower = basis+4*a55, basis-4*a55
-    recent = slice(-11, -1)
-    lower_trap = bool((df.close.iloc[recent] < lower.iloc[recent]).any() and close > lower.iat[-1])
-    upper_trap = bool((df.close.iloc[recent] > upper.iloc[recent]).any() and close < upper.iat[-1])
-    rh, rl = float(df.high.iloc[-22:-2].max()), float(df.low.iloc[-22:-2].min())
-    compressed = (rh-rl)/max(float(a55.iat[-2]), 1e-12) <= 8.0
-    bull_po3 = compressed and df.low.iat[-1] < rl and close > rl
-    bear_po3 = compressed and df.high.iat[-1] > rh and close < rh
-    bb_basis = sma(df.close, 200)
-    bb_dev = 2*df.close.rolling(200).std(ddof=0)
-    rv6, rv20 = rsi(df.close, 6), rsi(df.close, 20)
-    bull_reclaim = df.close.iat[-1] > df.open.iat[-1] and rv6.iat[-1] > rv6.iat[-2]
-    bear_reclaim = df.close.iat[-1] < df.open.iat[-1] and rv6.iat[-1] < rv6.iat[-2]
-    if not trending and (lower_trap or bull_po3):
-        score = sum([bull_reclaim, rv20.iat[-1] < 55, close < bb_basis.iat[-1],
-                     df.low.iat[-1] < (bb_basis-bb_dev).iat[-1], close > rl])
-        if score >= 3:
-            return {"side":"LONG", "stop":close*(1-0.50/LEVERAGE), "target":close*(1+2.0/LEVERAGE), "tag":f"COCKTAIL_REVERSAL_{score}/5"}
-    if not trending and (upper_trap or bear_po3):
-        score = sum([bear_reclaim, rv20.iat[-1] > 45, close > bb_basis.iat[-1],
-                     df.high.iat[-1] > (bb_basis+bb_dev).iat[-1], close < rh])
-        if score >= 3:
-            return {"side":"SHORT", "stop":close*(1+0.50/LEVERAGE), "target":close*(1-2.0/LEVERAGE), "tag":f"COCKTAIL_REVERSAL_{score}/5"}
-    return None
-
-
-class PaperBot:
-    def __init__(self):
-        self.market = Market()
-        try: STATE_DIR.mkdir(parents=True, exist_ok=True)
-        except PermissionError:
-            globals()["STATE_DIR"] = Path("./state"); STATE_DIR.mkdir(exist_ok=True)
-        self.path = STATE_DIR/f"{BOT_TYPE.lower()}_state.json"
-        self.state = self.load()
-        self.last_scan = 0
-
-    def load(self):
-        if self.path.exists():
-            try: return json.loads(self.path.read_text())
-            except Exception: log.exception("STATE LOAD FAILED")
-        return {"balance":START_BALANCE, "positions":{}, "closed":[], "last_signal":{}}
-
-    def save(self):
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, indent=2))
-        tmp.replace(self.path)
-
-    def apply_fee_adjusted_targets(self):
-        """Apply fee-adjusted 3-loss targets to restored open positions."""
-        changed = False
-        for p in self.state.get("positions", {}).values():
-            if "initial_stop" not in p:
-                p["initial_stop"] = p["stop"]
-                changed = True
-            target = fee_adjusted_three_loss_target(p["entry"], p["initial_stop"], p["side"])
-            if not math.isclose(p.get("target", target), target, rel_tol=1e-12, abs_tol=1e-12):
-                p["target"] = target
-                changed = True
-        if changed:
-            self.save()
-
-    def apply_staged_roi_management(self):
-        """Apply the shared -50/+100/+150/+200 ROI plan to restored positions."""
-        changed = False
-        for p in self.state.get("positions", {}).values():
-            entry, side = p["entry"], p["side"]
-            initial_stop = entry*(1-0.50/LEVERAGE) if side == "LONG" else entry*(1+0.50/LEVERAGE)
-            tp1 = entry*(1+1.00/LEVERAGE) if side == "LONG" else entry*(1-1.00/LEVERAGE)
-            tp2 = entry*(1+1.50/LEVERAGE) if side == "LONG" else entry*(1-1.50/LEVERAGE)
-            tp3 = entry*(1+2.00/LEVERAGE) if side == "LONG" else entry*(1-2.00/LEVERAGE)
-            p.setdefault("initial_qty", p["qty"])
-            p.setdefault("tp1_done", False)
-            p.setdefault("tp2_done", False)
-            p.setdefault("protected", p["tp1_done"])
-            p.setdefault("realized_pnl", 0.0)
-            p.update({"initial_stop":initial_stop, "tp1":tp1, "tp2":tp2, "tp3":tp3, "target":tp3})
-            p["stop"] = entry if p["protected"] or p["tp1_done"] else initial_stop
-            changed = True
-        if changed:
-            self.save()
-
-    def notify(self, message):
-        text = f"[{BOT_NAME}] {message}"
-        log.info(text)
-        if not TG_TOKEN or not TG_CHAT:
-            log.warning("TELEGRAM DISABLED: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
-            return
-        for attempt in range(1, 4):
-            try:
-                response = requests.post(
-                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                    data={"chat_id":TG_CHAT, "text":text, "disable_web_page_preview":True},
-                    timeout=15,
-                )
-                response.raise_for_status()
-                payload = response.json()
-                if not payload.get("ok"):
-                    raise RuntimeError(payload.get("description", "Telegram rejected the message"))
-                return
-            except Exception as exc:
-                if attempt == 3:
-                    log.error("TELEGRAM FAILED after 3 attempts: %s", exc)
-                else:
-                    log.warning("TELEGRAM attempt %s failed: %s", attempt, exc)
-                    time.sleep(2)
-
-    def open(self, symbol, price, signal):
-        if symbol in self.state["positions"]: return
-        if len(self.state["positions"]) >= MAX_POSITIONS: return
-        side, stop, target = signal["side"], signal["stop"], signal["target"]
-        if side == "LONG" and not stop < price < target: return
-        if side == "SHORT" and not target < price < stop: return
-        qty = NOTIONAL/price
-        self.state["positions"][symbol] = {
-            "side":side, "entry":price, "qty":qty, "notional":NOTIONAL,
-            "stop":stop, "target":target, "tag":signal["tag"],
-            "opened":datetime.now(timezone.utc).isoformat()
-        }
-        self.save()
-        self.notify(f"OPEN {symbol} {side} | entry {price:.8g} | SL {stop:.8g} | TP {target:.8g} | {signal['tag']}")
-
-    def open_cocktail(self, symbol, price, signal):
-        side = signal["side"]
-        stop = price*(1-0.50/LEVERAGE) if side == "LONG" else price*(1+0.50/LEVERAGE)
-        tp1 = price*(1+1.00/LEVERAGE) if side == "LONG" else price*(1-1.00/LEVERAGE)
-        tp2 = price*(1+1.50/LEVERAGE) if side == "LONG" else price*(1-1.50/LEVERAGE)
-        tp3 = price*(1+2.00/LEVERAGE) if side == "LONG" else price*(1-2.00/LEVERAGE)
-        qty = NOTIONAL/price
-        self.state["positions"][symbol] = {
-            "side":side, "entry":price, "qty":qty, "initial_qty":qty, "notional":NOTIONAL,
-            "stop":stop, "initial_stop":stop, "target":tp3, "tp1":tp1, "tp2":tp2, "tp3":tp3,
-            "tp1_done":False, "tp2_done":False, "protected":False, "realized_pnl":0.0,
-            "tag":signal["tag"], "opened":datetime.now(timezone.utc).isoformat()
-        }
-        self.save()
-        self.notify(f"OPEN {symbol} {side} | entry {price:.8g} | SL50 {stop:.8g} | TP 100/150/200 ROI | {signal['tag']}")
-
-    def cocktail_partial_close(self, symbol, price, qty_to_close, reason):
-        p = self.state["positions"][symbol]
-        qty_to_close = min(qty_to_close, p["qty"])
-        gross = (price-p["entry"])*qty_to_close*(1 if p["side"] == "LONG" else -1)
-        fees = (p["entry"]+price)*qty_to_close*FEE_RATE
-        pnl = gross-fees
-        self.state["balance"] += pnl
-        p["qty"] -= qty_to_close
-        p["realized_pnl"] = p.get("realized_pnl", 0.0)+pnl
-        self.notify(f"{reason} {symbol} | closed {qty_to_close/p['initial_qty']*100:.0f}% original | PNL {pnl:+.2f}$ | balance {self.state['balance']:.2f}$")
-        if p["qty"] <= p["initial_qty"]*1e-9:
-            closed = self.state["positions"].pop(symbol)
-            closed.update({"exit":price, "pnl":closed["realized_pnl"], "reason":reason, "closed":datetime.now(timezone.utc).isoformat()})
-            self.state["closed"] = (self.state["closed"]+[closed])[-1000:]
-        self.save()
-
-    def close(self, symbol, price, reason):
-        p = self.state["positions"].pop(symbol)
-        gross = (price-p["entry"])*p["qty"]*(1 if p["side"] == "LONG" else -1)
-        fees = (p["entry"]*p["qty"]+price*p["qty"])*FEE_RATE
-        pnl = gross-fees
-        self.state["balance"] += pnl
-        p.update({"exit":price,"pnl":pnl,"reason":reason,"closed":datetime.now(timezone.utc).isoformat()})
-        self.state["closed"] = (self.state["closed"]+[p])[-1000:]
-        self.save()
-        self.notify(f"CLOSE {symbol} {reason} | PNL {pnl:+.2f}$ | balance {self.state['balance']:.2f}$")
-
-    def manage(self):
-        if not self.state["positions"]: return
-        prices = self.market.prices()
-        for symbol, p in list(self.state["positions"].items()):
-            price = prices.get(symbol)
-            if not price: continue
-            if p["side"] == "LONG":
-                if price <= p["stop"]: self.close(symbol, p["stop"], "STOP")
-                elif price >= p["target"]: self.close(symbol, p["target"], "TARGET")
-            else:
-                if price >= p["stop"]: self.close(symbol, p["stop"], "STOP")
-                elif price <= p["target"]: self.close(symbol, p["target"], "TARGET")
-
-    def manage_cocktail(self, prices):
-        for symbol, p in list(self.state["positions"].items()):
-            price = prices.get(symbol)
-            if not price: continue
-            if p["side"] == "LONG" and price <= p["stop"]:
-                self.cocktail_partial_close(symbol, p["stop"], p["qty"], "STOP")
-                continue
-            if p["side"] == "SHORT" and price >= p["stop"]:
-                self.cocktail_partial_close(symbol, p["stop"], p["qty"], "STOP")
-                continue
-            hit1 = price >= p["tp1"]*(1-1e-12) if p["side"] == "LONG" else price <= p["tp1"]*(1+1e-12)
-            hit2 = price >= p["tp2"]*(1-1e-12) if p["side"] == "LONG" else price <= p["tp2"]*(1+1e-12)
-            hit3 = price >= p["tp3"]*(1-1e-12) if p["side"] == "LONG" else price <= p["tp3"]*(1+1e-12)
-            if hit1 and not p["tp1_done"]:
-                self.cocktail_partial_close(symbol, p["tp1"], p["initial_qty"]*0.50, "TP1_100ROI")
-                if symbol not in self.state["positions"]: continue
-                p = self.state["positions"][symbol]
-                p["tp1_done"], p["protected"], p["stop"] = True, True, p["entry"]
-                self.save()
-                self.notify(f"BREAKEVEN {symbol} {p['side']} | stop moved to entry {p['entry']:.8g} | slot released")
-            if symbol not in self.state["positions"]: continue
-            p = self.state["positions"][symbol]
-            if hit2 and not p["tp2_done"]:
-                self.cocktail_partial_close(symbol, p["tp2"], p["initial_qty"]*0.25, "TP2_150ROI")
-                if symbol not in self.state["positions"]: continue
-                self.state["positions"][symbol]["tp2_done"] = True
-                self.save()
-            if symbol in self.state["positions"] and hit3:
-                p = self.state["positions"][symbol]
-                self.cocktail_partial_close(symbol, p["tp3"], p["qty"], "TP3_200ROI")
-
-    def scan(self):
-        if len(self.state["positions"]) >= MAX_POSITIONS:
-            log.info("[%s] FULL positions=%s", BOT_NAME, len(self.state["positions"])); return
-        for symbol in self.market.symbols():
-            if symbol in self.state["positions"]: continue
-            try:
-                df = self.market.candles(symbol, limit=500)
-                if len(df) < 240: continue
-                signal = amd_po3_signal(df)
-                if signal:
-                    candle_id = str(int(df.open_time.iat[-1]))
-                    key = f"{symbol}:{signal['tag']}:{signal['side']}"
-                    if self.state["last_signal"].get(key) == candle_id: continue
-                    self.state["last_signal"][key] = candle_id
-                    self.open(symbol, float(df.close.iat[-1]), signal)
-            except Exception as exc:
-                log.warning("%s scan failed: %s", symbol, exc)
-
-    def run(self):
-        self.notify(f"START PAPER | balance {self.state['balance']:.2f}$ | leverage {LEVERAGE}x | notional {NOTIONAL}$ | max {MAX_POSITIONS}")
-        while True:
-            try:
-                self.manage()
-                if time.time()-self.last_scan >= SCAN_SECONDS:
-                    self.scan(); self.last_scan = time.time()
-            except KeyboardInterrupt: break
-            except Exception: log.exception("MAIN LOOP ERROR")
-            time.sleep(CHECK_SECONDS)
-
-
-if __name__ == "__main__":
-    if not DRY_RUN:
-        raise SystemExit("This build is PAPER MODE ONLY. Set DRY_RUN=true.")
-    PaperBot().run()
+def main():
+    if not KEY or not SECRET:raise RuntimeError("Missing Binance demo API keys")
+    exchange_info(); load()
+    # Never adopt unknown positions: safe for other bots on same account.
+    ps=positions()
+    for s in list(mine):
+        if s not in ps:mine.pop(s,None)
+    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | Basket: NET +$50 AFTER CLOSE FEES | BTC context controls NEW slots only; existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
+    last=0
+    while True:
+        try:
+            manage()
+            if time.time()-last>=20:scan();last=time.time()
+            time.sleep(5)
+        except Exception as e:
+            logging.exception(e);time.sleep(5)
+if __name__=="__main__":main()
