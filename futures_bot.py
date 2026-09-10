@@ -346,7 +346,15 @@ def manage():
             # Stair-step profit protection. Stages only move forward; never loosen a stop.
             if r>=200 and st<6:
                 cancel_algo(s)
-                close(s,p,100,"TP3 +200% ROI FINAL")
+                # TP3: close the ENTIRE live remainder, then verify Binance reports zero.
+                # No other strategy/risk/management logic is changed.
+                live=pos(s)
+                if live:
+                    close(s,live,100,"TP3 +200% ROI FINAL")
+                    time.sleep(.35)
+                remaining=pos(s)
+                if remaining:
+                    raise RuntimeError(f"{s}: TP3 final close incomplete; remaining qty={remaining.get('positionAmt')}")
                 mine[s]["lock_stage"]=6; save()
                 continue
             if r>=150 and st<5:
