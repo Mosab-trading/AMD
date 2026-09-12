@@ -8,10 +8,10 @@ import numpy as np
 KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V2.1.2-BREAKEVEN-SLOTS-MAXQTY-FIX-DEMO"
+BOT_VERSION="V2.1.4-4H-NEUTRAL-GATE-NO-PUFFER-DEMO"
 TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
-EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
+EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT","PUFFERUSDT"}
 BASKET=50.0; LOSS_LIMIT=100.0
 ALLOCATED_CAPITAL=float(os.getenv("ALLOCATED_CAPITAL","500"))
 TAKER_FEE_RATE=float(os.getenv("TAKER_FEE_RATE","0.0005"))
@@ -493,6 +493,23 @@ def rsi_last(vals, period=14):
     rs=up/dn.replace(0,np.nan); z=100-(100/(1+rs))
     return float(z.iloc[-1]) if len(z) and pd.notna(z.iloc[-1]) else 50.0
 
+def btc_4h_direction():
+    """BTC 4H reference direction used ONLY when the 15m BTC context is NEUTRAL."""
+    try:
+        k=pub("/fapi/v1/klines",{"symbol":"BTCUSDT","interval":"4h","limit":110})
+        if k and int(k[-1][6])>=int(time.time()*1000):k=k[:-1]
+        if not k or len(k)<99:return "NEUTRAL"
+        closes=[float(x[4]) for x in k]
+        last=closes[-1]
+        m25=sum(closes[-25:])/25
+        m99=sum(closes[-99:])/99
+        if last>m99 and last>m25:return "LONG"
+        if last<m99 and last<m25:return "SHORT"
+        return "NEUTRAL"
+    except Exception as e:
+        logging.warning("BTC 4H direction failed: %s",e)
+        return "NEUTRAL"
+
 def btc_context():
     """BTC flow is a SMALL scoring input only. It cannot block either side."""
     k=klines("BTCUSDT")
@@ -598,10 +615,17 @@ def scan():
         try:
             # V2.1: market direction controls NEW slots only. Existing positions are never
             # force-closed on a BTC context flip; they keep their own SL/TP management.
-            if ctx["bias"] in ("SHORT","NEUTRAL"):
+            # Direction gate ONLY for BTC NEUTRAL:
+            # - Explicit 15m LONG  -> LONG only, regardless of 4H.
+            # - Explicit 15m SHORT -> SHORT only, regardless of 4H.
+            # - 15m NEUTRAL        -> follow the 4H reference direction only.
+            gate_bias=ctx["bias"]
+            if gate_bias=="NEUTRAL":
+                gate_bias=btc_4h_direction()
+            if gate_bias=="SHORT":
                 sh=short_engine(s,ctx)
                 if sh:candidates.append((float(sh["score"]),s,sh))
-            if ctx["bias"] in ("LONG","NEUTRAL"):
+            if gate_bias=="LONG":
                 lo=long_engine(s,ctx)
                 if lo:candidates.append((float(lo["score"]),s,lo))
         except Exception as e:logging.warning("%s scoring failed: %s",s,e)
