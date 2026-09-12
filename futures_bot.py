@@ -5,11 +5,11 @@ import requests
 import pandas as pd
 import numpy as np
 
-KEY=os.getenv("BINANCE_DEMO_API_KEY",""); SECRET=os.getenv("BINANCE_DEMO_API_SECRET","")
-BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
+KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
+BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V2.1.5-4H-NEUTRAL-GATE-NO-PUFFER-NO-BASKET-DEMO"
-TF="15m"; NOTIONAL=300.0; TARGET_LEV=20; MAX_POS=20
+BOT_VERSION="V2.1.7-4H-NEUTRAL-GATE-NO-PUFFER-NO-BASKET-LIVE-SAFE-STOP"
+TF="15m"; NOTIONAL=200.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT","PUFFERUSDT"}
 BASKET=50.0; LOSS_LIMIT=100.0
@@ -244,7 +244,7 @@ def enter(s,d):
              "initial_qty":abs(float(p["positionAmt"])),"entry_time":int(time.time()*1000)-10000,
              "accounted_trade_ids":[]}; save()
     sync_realized()
-    msg(f"OPEN {d} {s}\nNotional: $300 | Leverage: {lev}x\nEntry: {ep}\nProfit Lock: +30->SL -25 | +50->BE | +75->SL +25 | TP1 +100% (50%, SL +50) | TP2 +150% (25%, SL +100) | TP3 +200% final")
+    msg(f"OPEN {d} {s}\nNotional: $200 | Leverage: {lev}x\nEntry: {ep}\nProfit Lock: +30->SL -25 | +50->BE | +75->SL +25 | TP1 +100% (50%, SL +50) | TP2 +150% (25%, SL +100) | TP3 +200% final")
 def close_all(reason):
     global cycle_realized,losing_cycles,pause_until,basket_lock_candle,basket_rearm_dir,basket_rearm_touched
     ps=positions(); targets=[(s,p) for s,p in ps.items() if s in mine]
@@ -309,13 +309,30 @@ def close_all(reason):
     return True
 
 def protected_stop_for_roi(s,p,d,target_roi):
-    """Replace the single exchange-side STOP so a retrace locks target leveraged ROI."""
+    """Replace the STOP safely; if the new profit-lock stop fails, restore the previous protection."""
     ep=float(p["entryPrice"]); lev=float(p.get("leverage",20))
     move=(float(target_roi)/100.0)/max(lev,1.0)
     sp=ep*(1+move) if d=="LONG" else ep*(1-move)
+
+    # Fallback is the protection level that was active before this requested stage.
+    st=int(mine.get(s,{}).get("lock_stage",0))
+    previous_roi={0:-50,1:-25,2:0,3:25,4:50,5:100}.get(st,-50)
+    prev_move=(float(previous_roi)/100.0)/max(lev,1.0)
+    prev_sp=ep*(1+prev_move) if d=="LONG" else ep*(1-prev_move)
+
     cancel_algo(s)
-    stop(s,d,sp)
-    return sp
+    try:
+        stop(s,d,sp)
+        return sp
+    except Exception as new_stop_error:
+        logging.error("%s NEW STOP FAILED at ROI %s: %s",s,target_roi,new_stop_error)
+        try:
+            stop(s,d,prev_sp)
+            msg(f"{s} STOP SAFETY: new stop failed; previous protection restored", bal=False)
+        except Exception as restore_error:
+            logging.critical("%s STOP SAFETY FAILED: could not restore protection: %s",s,restore_error)
+            msg(f"URGENT {s}: STOP REPLACEMENT FAILED AND FALLBACK STOP COULD NOT BE RESTORED. Check Binance position immediately.", bal=False)
+        raise
 
 def manage():
     global pause_until,loss_window
@@ -637,13 +654,13 @@ def scan():
                  closed_candle,ctx["bias"],opened,entries_this_candle,open_position_count(),risk_position_count(),MAX_POS)
 
 def main():
-    if not KEY or not SECRET:raise RuntimeError("Missing Binance demo API keys")
+    if not KEY or not SECRET:raise RuntimeError("Missing Binance LIVE API keys")
     exchange_info(); load()
     # Never adopt unknown positions: safe for other bots on same account.
     ps=positions()
     for s in list(mine):
         if s not in ps:mine.pop(s,None)
-    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $300 | Max: 20 | BTC context controls NEW slots only; BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
+    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $200 | Max: 20 | BTC context controls NEW slots only; BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
     last=0
     while True:
         try:
