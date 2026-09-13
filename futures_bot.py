@@ -19,6 +19,8 @@ S=requests.Session(); S.headers.update({"X-MBX-APIKEY":KEY})
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0; bot_realized=0; basket_lock_candle=0; entry_candle=0; entries_this_candle=0; basket_rearm_dir=""; basket_rearm_touched=False
 STATE="state.json"
+REPORT_STATE="fifty_trade_report.json"
+REPORT_EVERY_TRADES=50
 
 def pub(path,p=None):
     r=S.get(BASE+path,params=p or {},timeout=15); r.raise_for_status(); return r.json()
@@ -334,13 +336,86 @@ def protected_stop_for_roi(s,p,d,target_roi):
             msg(f"URGENT {s}: STOP REPLACEMENT FAILED AND FALLBACK STOP COULD NOT BE RESTORED. Check Binance position immediately.", bal=False)
         raise
 
+
+def _report_load():
+    try:
+        return json.load(open(REPORT_STATE))
+    except:
+        return {"started":int(time.time()),"closed":[]}
+
+def _report_save(d):
+    try:
+        with open(REPORT_STATE,"w") as f: json.dump(d,f)
+    except Exception as e:
+        logging.warning("5D report save failed: %s",e)
+
+def record_closed_trade(s, st):
+    """Diagnostics only: capture Binance trade-history facts for the 5-day report."""
+    try:
+        rows=trade_rows(s,st.get("entry_time",0))
+        if not rows:return
+        realized=sum(float(x.get("realizedPnl",0)) for x in rows)
+        commission=sum(float(x.get("commission",0)) for x in rows)
+        exits=[x for x in rows if abs(float(x.get("realizedPnl",0)))>0]
+        exit_px=float(exits[-1].get("price",0)) if exits else 0.0
+        last_time=max([int(x.get("time",0)) for x in rows] or [int(time.time()*1000)])
+        duration=max(0,(last_time-int(st.get("entry_time",last_time)))/1000)
+        net=realized-commission
+        reason="EXCHANGE_CLOSE"
+        stage=int(st.get("lock_stage",0))
+        if stage>=6: reason="TP3_FINAL"
+        elif stage>=5: reason="AFTER_TP2_OR_PROTECTED_STOP"
+        elif stage>=4: reason="AFTER_TP1_OR_PROTECTED_STOP"
+        elif stage>=3: reason="PROFIT_LOCK_+25_STOP_OR_EXTERNAL"
+        elif stage>=2: reason="BREAKEVEN_STOP_OR_EXTERNAL"
+        elif stage>=1: reason="PROTECTED_-25_STOP_OR_EXTERNAL"
+        elif net<0: reason="INITIAL_SL_OR_EXTERNAL"
+        d=_report_load()
+        d["closed"].append({"symbol":s,"side":st.get("dir",""),"net":net,
+                            "realized":realized,"commission":commission,
+                            "exit_price":exit_px,"duration_sec":duration,
+                            "reason":reason,"lock_stage":stage,"time":last_time})
+        _report_save(d)
+        logging.info("%s EXIT DIAG | reason=%s | exit=%s | realized=%.4f | fees=%.4f | net=%.4f | duration=%.0fs",
+                     s,reason,exit_px,realized,commission,net,duration)
+    except Exception as e:
+        logging.warning("%s exit diagnostic failed: %s",s,e)
+
+def maybe_fifty_trade_report():
+    """Send one diagnostic summary after every 50 closed trades; never changes trading decisions."""
+    d=_report_load()
+    now=int(time.time())
+    rows=d.get("closed",[])
+    if len(rows) < REPORT_EVERY_TRADES:return
+    rows=rows[:REPORT_EVERY_TRADES]
+    wins=[x for x in rows if x.get("net",0)>0]; losses=[x for x in rows if x.get("net",0)<0]
+    net=sum(x.get("net",0) for x in rows)
+    fees=sum(x.get("commission",0) for x in rows)
+    from collections import Counter
+    loss_reasons=Counter(x.get("reason","UNKNOWN") for x in losses)
+    sides=Counter(x.get("side","UNKNOWN") for x in losses)
+    reasons=", ".join(f"{k}: {v}" for k,v in loss_reasons.most_common()) or "None"
+    loss_sides=", ".join(f"{k}: {v}" for k,v in sides.most_common()) or "None"
+    report=(f"50-TRADE BOT DIAGNOSTIC REPORT\n"
+            f"Closed trades: {len(rows)} | Wins: {len(wins)} | Losses: {len(losses)}\n"
+            f"Win rate: {(100*len(wins)/len(rows) if rows else 0):.1f}%\n"
+            f"Net PnL: ${net:.2f} | Fees: ${fees:.2f}\n"
+            f"Loss/exit causes: {reasons}\n"
+            f"Losing sides: {loss_sides}\n"
+            f"NOTE: diagnostic report only; strategy and trade management unchanged.")
+    msg(report,bal=False)
+    _report_save({"started":now,"closed":d.get("closed",[])[REPORT_EVERY_TRADES:]})
+
 def manage():
     global pause_until,loss_window
     sync_realized()
+    maybe_fifty_trade_report()
     ps=positions()
     for s in list(mine):
         if s not in ps:
+            st=dict(mine.get(s,{}))
             sync_realized()
+            record_closed_trade(s,st)
             mine.pop(s,None); save()
             msg(f"{s} CLOSED ON EXCHANGE | Actual PnL reconciled")
     for s in list(mine):
