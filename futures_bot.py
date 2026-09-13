@@ -9,7 +9,7 @@ KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
 BOT_VERSION="V2.1.7-4H-NEUTRAL-GATE-NO-PUFFER-NO-BASKET-LIVE-SAFE-STOP"
-TF="15m"; NOTIONAL=200.0; TARGET_LEV=20; MAX_POS=20
+TF="15m"; NOTIONAL=100.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT","PUFFERUSDT"}
 BASKET=50.0; LOSS_LIMIT=100.0
@@ -230,8 +230,7 @@ def enter(s,d):
     # consumes one of the 20 RISK slots. It stays open and managed normally.
     if risk_position_count(ps)>=MAX_POS or s in ps:return
     px=float(pub("/fapi/v1/ticker/price",{"symbol":s})["price"]); lev=leverage(s)
-    effective_notional=NOTIONAL*(lev/TARGET_LEV)
-    qty=qty_ok(s,effective_notional/px)
+    qty=qty_ok(s,(NOTIONAL*(lev/TARGET_LEV))/px)
     if qty<meta[s]["min"] or qty<=0:return
     market(s,"BUY" if d=="LONG" else "SELL",qty); time.sleep(.25); p=pos(s)
     if not p:return
