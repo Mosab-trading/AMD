@@ -411,28 +411,34 @@ def manage():
         st=int(mine[s].get("lock_stage",0))
         initial_qty=float(mine[s].get("initial_qty",abs(float(p["positionAmt"]))))
 
-        try:
+                try:
             # Stair-step profit protection. Stages only move forward; never loosen a stop.
-       if r>=100 and st<4:
+            if r>=100 and st<4:
                 cancel_algo(s)
                 close(s,p,100,"TP +100% ROI FINAL")
                 mine[s]["tp1"]=True
                 mine[s]["lock_stage"]=6
                 save()
-                continue 
+                continue
+
             if r>=75 and st<3:
                 protected_stop_for_roi(s,p,d,25)
-                mine[s]["lock_stage"]=3; save()
+                mine[s]["lock_stage"]=3
+                save()
                 msg(f"{s} PROFIT LOCK | ROI +75% -> SL +25% ROI")
                 continue
+
             if r>=50 and st<2:
                 protected_stop_for_roi(s,p,d,0)
-                mine[s]["lock_stage"]=2; save()
+                mine[s]["lock_stage"]=2
+                save()
                 msg(f"{s} PROFIT LOCK | ROI +50% -> SL BREAKEVEN")
                 continue
+
             if r>=30 and st<1:
                 protected_stop_for_roi(s,p,d,-25)
-                mine[s]["lock_stage"]=1; save()
+                mine[s]["lock_stage"]=1
+                save()
                 msg(f"{s} PROFIT LOCK | ROI +30% -> SL -25% ROI")
                 continue
         except Exception as e:
