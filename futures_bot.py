@@ -629,12 +629,10 @@ def scan():
             # - Explicit 15m SHORT -> SHORT only, regardless of 4H.
             # - 15m NEUTRAL        -> follow the 4H reference direction only.
             gate_bias=ctx["bias"]
-            if gate_bias=="NEUTRAL":
-                gate_bias=btc_4h_direction()
-            if gate_bias=="SHORT":
+            if gate_bias in ("SHORT","NEUTRAL"):
                 sh=short_engine(s,ctx)
                 if sh:candidates.append((float(sh["score"]),s,sh))
-            if gate_bias=="LONG":
+            if gate_bias in ("LONG","NEUTRAL"):
                 lo=long_engine(s,ctx)
                 if lo:candidates.append((float(lo["score"]),s,lo))
         except Exception as e:logging.warning("%s scoring failed: %s",s,e)
