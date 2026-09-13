@@ -413,13 +413,13 @@ def manage():
 
         try:
             # Stair-step profit protection. Stages only move forward; never loosen a stop.
-            if r>=100 and st<4:
-    cancel_algo(s)
-    close(s,p,100,"TP +100% ROI FINAL")
-    mine[s]["tp1"]=True
-    mine[s]["lock_stage"]=6
-    save()
-    continue
+       if r>=100 and st<4:
+                cancel_algo(s)
+                close(s,p,100,"TP +100% ROI FINAL")
+                mine[s]["tp1"]=True
+                mine[s]["lock_stage"]=6
+                save()
+                continue 
             if r>=75 and st<3:
                 protected_stop_for_roi(s,p,d,25)
                 mine[s]["lock_stage"]=3; save()
