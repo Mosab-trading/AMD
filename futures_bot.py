@@ -8,10 +8,10 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V2.1.7-4H-NEUTRAL-GATE-NO-PUFFER-NO-BASKET-LIVE-SAFE-STOP"
+BOT_VERSION="V2.1.2-BREAKEVEN-SLOTS-MAXQTY-FIX-LIVE-NO-BASKET-50REPORT"
 TF="15m"; NOTIONAL=100.0; TARGET_LEV=20; MAX_POS=20
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
-EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT","PUFFERUSDT"}
+EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
 BASKET=50.0; LOSS_LIMIT=100.0
 ALLOCATED_CAPITAL=float(os.getenv("ALLOCATED_CAPITAL","500"))
 TAKER_FEE_RATE=float(os.getenv("TAKER_FEE_RATE","0.0005"))
@@ -232,7 +232,7 @@ def enter(s,d):
     # consumes one of the 20 RISK slots. It stays open and managed normally.
     if risk_position_count(ps)>=MAX_POS or s in ps:return
     px=float(pub("/fapi/v1/ticker/price",{"symbol":s})["price"]); lev=leverage(s)
-    qty=qty_ok(s,(NOTIONAL*(lev/TARGET_LEV))/px)
+    qty=qty_ok(s,NOTIONAL/px)
     if qty<meta[s]["min"] or qty<=0:return
     market(s,"BUY" if d=="LONG" else "SELL",qty); time.sleep(.25); p=pos(s)
     if not p:return
@@ -246,7 +246,7 @@ def enter(s,d):
              "initial_qty":abs(float(p["positionAmt"])),"entry_time":int(time.time()*1000)-10000,
              "accounted_trade_ids":[]}; save()
     sync_realized()
-    msg(f"OPEN {d} {s}\nNotional: $200 | Leverage: {lev}x\nEntry: {ep}\nProfit Lock: +30->SL -25 | +50->BE | +75->SL +25 | TP1 +100% (50%, SL +50) | TP2 +150% (25%, SL +100) | TP3 +200% final")
+    msg(f"OPEN {d} {s}\nNotional: $100 | Leverage: {lev}x\nEntry: {ep}\nProfit Lock: +30->SL -25 | +50->BE | +75->SL +25 | TP1 +100% (50%, SL +50) | TP2 +150% (25%, SL +100) | TP3 +200% final")
 def close_all(reason):
     global cycle_realized,losing_cycles,pause_until,basket_lock_candle,basket_rearm_dir,basket_rearm_touched
     ps=positions(); targets=[(s,p) for s,p in ps.items() if s in mine]
@@ -311,46 +311,29 @@ def close_all(reason):
     return True
 
 def protected_stop_for_roi(s,p,d,target_roi):
-    """Replace the STOP safely; if the new profit-lock stop fails, restore the previous protection."""
+    """Replace the single exchange-side STOP so a retrace locks target leveraged ROI."""
     ep=float(p["entryPrice"]); lev=float(p.get("leverage",20))
     move=(float(target_roi)/100.0)/max(lev,1.0)
     sp=ep*(1+move) if d=="LONG" else ep*(1-move)
-
-    # Fallback is the protection level that was active before this requested stage.
-    st=int(mine.get(s,{}).get("lock_stage",0))
-    previous_roi={0:-50,1:-25,2:0,3:25,4:50,5:100}.get(st,-50)
-    prev_move=(float(previous_roi)/100.0)/max(lev,1.0)
-    prev_sp=ep*(1+prev_move) if d=="LONG" else ep*(1-prev_move)
-
     cancel_algo(s)
-    try:
-        stop(s,d,sp)
-        return sp
-    except Exception as new_stop_error:
-        logging.error("%s NEW STOP FAILED at ROI %s: %s",s,target_roi,new_stop_error)
-        try:
-            stop(s,d,prev_sp)
-            msg(f"{s} STOP SAFETY: new stop failed; previous protection restored", bal=False)
-        except Exception as restore_error:
-            logging.critical("%s STOP SAFETY FAILED: could not restore protection: %s",s,restore_error)
-            msg(f"URGENT {s}: STOP REPLACEMENT FAILED AND FALLBACK STOP COULD NOT BE RESTORED. Check Binance position immediately.", bal=False)
-        raise
+    stop(s,d,sp)
+    return sp
 
 
 def _report_load():
     try:
         return json.load(open(REPORT_STATE))
     except:
-        return {"started":int(time.time()),"closed":[]}
+        return {"closed":[]}
 
 def _report_save(d):
     try:
         with open(REPORT_STATE,"w") as f: json.dump(d,f)
     except Exception as e:
-        logging.warning("5D report save failed: %s",e)
+        logging.warning("50-trade report save failed: %s",e)
 
 def record_closed_trade(s, st):
-    """Diagnostics only: capture Binance trade-history facts for the 5-day report."""
+    """Diagnostics only. Does not affect signals, entries, exits, SL or TP."""
     try:
         rows=trade_rows(s,st.get("entry_time",0))
         if not rows:return
@@ -361,8 +344,8 @@ def record_closed_trade(s, st):
         last_time=max([int(x.get("time",0)) for x in rows] or [int(time.time()*1000)])
         duration=max(0,(last_time-int(st.get("entry_time",last_time)))/1000)
         net=realized-commission
-        reason="EXCHANGE_CLOSE"
         stage=int(st.get("lock_stage",0))
+        reason="EXCHANGE_CLOSE"
         if stage>=6: reason="TP3_FINAL"
         elif stage>=5: reason="AFTER_TP2_OR_PROTECTED_STOP"
         elif stage>=4: reason="AFTER_TP1_OR_PROTECTED_STOP"
@@ -371,10 +354,12 @@ def record_closed_trade(s, st):
         elif stage>=1: reason="PROTECTED_-25_STOP_OR_EXTERNAL"
         elif net<0: reason="INITIAL_SL_OR_EXTERNAL"
         d=_report_load()
-        d["closed"].append({"symbol":s,"side":st.get("dir",""),"net":net,
-                            "realized":realized,"commission":commission,
-                            "exit_price":exit_px,"duration_sec":duration,
-                            "reason":reason,"lock_stage":stage,"time":last_time})
+        d["closed"].append({
+            "symbol":s,"side":st.get("dir",""),"net":net,
+            "realized":realized,"commission":commission,
+            "exit_price":exit_px,"duration_sec":duration,
+            "reason":reason,"lock_stage":stage,"time":last_time
+        })
         _report_save(d)
         logging.info("%s EXIT DIAG | reason=%s | exit=%s | realized=%.4f | fees=%.4f | net=%.4f | duration=%.0fs",
                      s,reason,exit_px,realized,commission,net,duration)
@@ -382,34 +367,33 @@ def record_closed_trade(s, st):
         logging.warning("%s exit diagnostic failed: %s",s,e)
 
 def maybe_fifty_trade_report():
-    """Send one diagnostic summary after every 50 closed trades; never changes trading decisions."""
+    """Telegram/log report every 50 closed trades; reporting only."""
     d=_report_load()
-    now=int(time.time())
     rows=d.get("closed",[])
-    if len(rows) < REPORT_EVERY_TRADES:return
-    rows=rows[:REPORT_EVERY_TRADES]
-    wins=[x for x in rows if x.get("net",0)>0]; losses=[x for x in rows if x.get("net",0)<0]
-    net=sum(x.get("net",0) for x in rows)
-    fees=sum(x.get("commission",0) for x in rows)
+    if len(rows)<REPORT_EVERY_TRADES:return
+    batch=rows[:REPORT_EVERY_TRADES]
+    wins=[x for x in batch if x.get("net",0)>0]
+    losses=[x for x in batch if x.get("net",0)<0]
+    net=sum(x.get("net",0) for x in batch)
+    fees=sum(x.get("commission",0) for x in batch)
     from collections import Counter
-    loss_reasons=Counter(x.get("reason","UNKNOWN") for x in losses)
+    reasons=Counter(x.get("reason","UNKNOWN") for x in losses)
     sides=Counter(x.get("side","UNKNOWN") for x in losses)
-    reasons=", ".join(f"{k}: {v}" for k,v in loss_reasons.most_common()) or "None"
-    loss_sides=", ".join(f"{k}: {v}" for k,v in sides.most_common()) or "None"
+    reason_text=", ".join(f"{k}: {v}" for k,v in reasons.most_common()) or "None"
+    side_text=", ".join(f"{k}: {v}" for k,v in sides.most_common()) or "None"
     report=(f"50-TRADE BOT DIAGNOSTIC REPORT\n"
-            f"Closed trades: {len(rows)} | Wins: {len(wins)} | Losses: {len(losses)}\n"
-            f"Win rate: {(100*len(wins)/len(rows) if rows else 0):.1f}%\n"
+            f"Closed trades: {len(batch)} | Wins: {len(wins)} | Losses: {len(losses)}\n"
+            f"Win rate: {(100*len(wins)/len(batch) if batch else 0):.1f}%\n"
             f"Net PnL: ${net:.2f} | Fees: ${fees:.2f}\n"
-            f"Loss/exit causes: {reasons}\n"
-            f"Losing sides: {loss_sides}\n"
+            f"Loss/exit causes: {reason_text}\n"
+            f"Losing sides: {side_text}\n"
             f"NOTE: diagnostic report only; strategy and trade management unchanged.")
     msg(report,bal=False)
-    _report_save({"started":now,"closed":d.get("closed",[])[REPORT_EVERY_TRADES:]})
+    _report_save({"closed":rows[REPORT_EVERY_TRADES:]})
 
 def manage():
     global pause_until,loss_window
     sync_realized()
-    maybe_fifty_trade_report()
     ps=positions()
     for s in list(mine):
         if s not in ps:
@@ -418,6 +402,7 @@ def manage():
             record_closed_trade(s,st)
             mine.pop(s,None); save()
             msg(f"{s} CLOSED ON EXCHANGE | Actual PnL reconciled")
+            maybe_fifty_trade_report()
     for s in list(mine):
         p=ps.get(s)
         if not p: continue
@@ -430,15 +415,7 @@ def manage():
             # Stair-step profit protection. Stages only move forward; never loosen a stop.
             if r>=200 and st<6:
                 cancel_algo(s)
-                # TP3: close the ENTIRE live remainder, then verify Binance reports zero.
-                # No other strategy/risk/management logic is changed.
-                live=pos(s)
-                if live:
-                    close(s,live,100,"TP3 +200% ROI FINAL")
-                    time.sleep(.35)
-                remaining=pos(s)
-                if remaining:
-                    raise RuntimeError(f"{s}: TP3 final close incomplete; remaining qty={remaining.get('positionAmt')}")
+                close(s,p,100,"TP3 +200% ROI FINAL")
                 mine[s]["lock_stage"]=6; save()
                 continue
             if r>=150 and st<5:
@@ -577,23 +554,6 @@ def rsi_last(vals, period=14):
     rs=up/dn.replace(0,np.nan); z=100-(100/(1+rs))
     return float(z.iloc[-1]) if len(z) and pd.notna(z.iloc[-1]) else 50.0
 
-def btc_4h_direction():
-    """BTC 4H reference direction used ONLY when the 15m BTC context is NEUTRAL."""
-    try:
-        k=pub("/fapi/v1/klines",{"symbol":"BTCUSDT","interval":"4h","limit":110})
-        if k and int(k[-1][6])>=int(time.time()*1000):k=k[:-1]
-        if not k or len(k)<99:return "NEUTRAL"
-        closes=[float(x[4]) for x in k]
-        last=closes[-1]
-        m25=sum(closes[-25:])/25
-        m99=sum(closes[-99:])/99
-        if last>m99 and last>m25:return "LONG"
-        if last<m99 and last<m25:return "SHORT"
-        return "NEUTRAL"
-    except Exception as e:
-        logging.warning("BTC 4H direction failed: %s",e)
-        return "NEUTRAL"
-
 def btc_context():
     """BTC flow is a SMALL scoring input only. It cannot block either side."""
     k=klines("BTCUSDT")
@@ -688,7 +648,6 @@ def scan():
                           "New positions: LONG or SHORT by setup score")
         msg(f"BTC MARKET CHANGE: {old_mode} -> {btc_mode}\n{direction_text}\nExisting positions continue with Profit Lock / SL / TP", bal=False)
         save()
-    if basket_lock_candle and closed_candle<=basket_lock_candle:return
     if closed_candle!=entry_candle:
         entry_candle=closed_candle; entries_this_candle=0; save()
     limit=min(max(0,2-entries_this_candle),max(0,MAX_POS-risk_position_count()))
@@ -699,15 +658,10 @@ def scan():
         try:
             # V2.1: market direction controls NEW slots only. Existing positions are never
             # force-closed on a BTC context flip; they keep their own SL/TP management.
-            # Direction gate ONLY for BTC NEUTRAL:
-            # - Explicit 15m LONG  -> LONG only, regardless of 4H.
-            # - Explicit 15m SHORT -> SHORT only, regardless of 4H.
-            # - 15m NEUTRAL        -> follow the 4H reference direction only.
-            gate_bias=ctx["bias"]
-            if gate_bias in ("SHORT","NEUTRAL"):
+            if ctx["bias"] in ("SHORT","NEUTRAL"):
                 sh=short_engine(s,ctx)
                 if sh:candidates.append((float(sh["score"]),s,sh))
-            if gate_bias in ("LONG","NEUTRAL"):
+            if ctx["bias"] in ("LONG","NEUTRAL"):
                 lo=long_engine(s,ctx)
                 if lo:candidates.append((float(lo["score"]),s,lo))
         except Exception as e:logging.warning("%s scoring failed: %s",s,e)
@@ -733,7 +687,7 @@ def main():
     ps=positions()
     for s in list(mine):
         if s not in ps:mine.pop(s,None)
-    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $200 | Max: 20 | BTC context controls NEW slots only; BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
+    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $100 | Max: 20 | BTC context controls NEW slots only; BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
     last=0
     while True:
         try:
