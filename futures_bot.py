@@ -240,6 +240,10 @@ def enter(s,d):
     sp=ep*(1-adverse) if d=="LONG" else ep*(1+adverse)
     cancel_algo(s)
     stop(s,d,sp)
+
+    favorable=.50/lev
+    tp=ep*(1+favorable) if d=="LONG" else ep*(1-favorable)
+    algo_close(s,d,"TAKE_PROFIT_MARKET",tp,close_position=True)
     # V2.1: keep ONE exchange-side protective STOP only. Profit targets are managed
     # by manage() from live leveraged ROI. This prevents -4045 max algo/stop-order saturation.
     mine[s]={"dir":d,"tp1":False,"tp2":False,"lock_stage":0,
