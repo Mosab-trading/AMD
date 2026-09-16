@@ -9,7 +9,7 @@ KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
 BOT_VERSION="V2.1.2-BREAKEVEN-SLOTS-MAXQTY-FIX-LIVE-NO-BASKET-50REPORT"
-TF="15m"; NOTIONAL=100.0; TARGET_LEV=20; MAX_POS=20
+TF="15m"; NOTIONAL=100.0; TARGET_LEV=20; MAX_POS=25
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
 BASKET=50.0; LOSS_LIMIT=100.0
@@ -657,7 +657,7 @@ def main():
     ps=positions()
     for s in list(mine):
         if s not in ps:mine.pop(s,None)
-    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $100 | Max: 20 | BTC context controls NEW slots only; BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
+    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $100 | Max: 25 | BTC context controls NEW slots only; BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
     last=0
     while True:
         try:
