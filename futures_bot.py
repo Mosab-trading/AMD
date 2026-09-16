@@ -412,7 +412,10 @@ def manage():
         initial_qty=float(mine[s].get("initial_qty",abs(float(p["positionAmt"]))))
 
         try:
-            if r>=50: cancel_algo(s) close(s, p, 100, "TP +50% ROI FINAL") continue
+            if r>=50:
+                cancel_algo(s)
+                close(s,p,100,"TP +50% ROI FINAL")
+                continue
         except Exception as e:
             logging.warning("%s profit-lock management failed: %s",s,e)
             # Best effort: if stop replacement/partial close failed, do not advance stage.
