@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
-BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
+BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
 BOT_VERSION="V2.1.2-BREAKEVEN-SLOTS-MAXQTY-FIX-LIVE-NO-BASKET-50REPORT"
 TF="15m"; NOTIONAL=100.0; TARGET_LEV=20; MAX_POS=20
