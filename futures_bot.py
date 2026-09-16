@@ -412,44 +412,7 @@ def manage():
         initial_qty=float(mine[s].get("initial_qty",abs(float(p["positionAmt"]))))
 
         try:
-            # Stair-step profit protection. Stages only move forward; never loosen a stop.
-            if r>=200 and st<6:
-                cancel_algo(s)
-                close(s,p,100,"TP3 +200% ROI FINAL")
-                mine[s]["lock_stage"]=6; save()
-                continue
-            if r>=150 and st<5:
-                # Close 25% of ORIGINAL size (normally 50% of the remaining half).
-                live_qty=abs(float(p["positionAmt"]))
-                q_pct=min(100.0,100.0*(initial_qty*0.25)/max(live_qty,1e-12))
-                cancel_algo(s); close(s,p,q_pct,"TP2 +150% ROI (25% ORIGINAL)")
-                time.sleep(.25); lp=pos(s)
-                if lp: protected_stop_for_roi(s,lp,d,100)
-                mine[s]["tp2"]=True; mine[s]["lock_stage"]=5; save()
-                msg(f"{s} PROFIT LOCK | TP2 DONE | Remaining SL -> +100% ROI")
-                continue
-            if r>=100 and st<4:
-                cancel_algo(s); close(s,p,50,"TP1 +100% ROI (50%)")
-                time.sleep(.25); lp=pos(s)
-                if lp: protected_stop_for_roi(s,lp,d,50)
-                mine[s]["tp1"]=True; mine[s]["lock_stage"]=4; save()
-                msg(f"{s} PROFIT LOCK | TP1 DONE | Remaining SL -> +50% ROI")
-                continue
-            if r>=75 and st<3:
-                protected_stop_for_roi(s,p,d,25)
-                mine[s]["lock_stage"]=3; save()
-                msg(f"{s} PROFIT LOCK | ROI +75% -> SL +25% ROI")
-                continue
-            if r>=50 and st<2:
-                protected_stop_for_roi(s,p,d,0)
-                mine[s]["lock_stage"]=2; save()
-                msg(f"{s} PROFIT LOCK | ROI +50% -> SL BREAKEVEN")
-                continue
-            if r>=30 and st<1:
-                protected_stop_for_roi(s,p,d,-25)
-                mine[s]["lock_stage"]=1; save()
-                msg(f"{s} PROFIT LOCK | ROI +30% -> SL -25% ROI")
-                continue
+            if r>=50: cancel_algo(s) close(s, p, 100, "TP +50% ROI FINAL") continue
         except Exception as e:
             logging.warning("%s profit-lock management failed: %s",s,e)
             # Best effort: if stop replacement/partial close failed, do not advance stage.
