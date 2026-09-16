@@ -232,7 +232,7 @@ def enter(s,d):
     # consumes one of the 20 RISK slots. It stays open and managed normally.
     if risk_position_count(ps)>=MAX_POS or s in ps:return
     px=float(pub("/fapi/v1/ticker/price",{"symbol":s})["price"]); lev=leverage(s)
-    qty=qty_ok(s,NOTIONAL/px)
+    qty=qty ok s, (2.5*lev)/px
     if qty<meta[s]["min"] or qty<=0:return
     market(s,"BUY" if d=="LONG" else "SELL",qty); time.sleep(.25); p=pos(s)
     if not p:return
