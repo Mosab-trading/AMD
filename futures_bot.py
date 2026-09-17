@@ -246,38 +246,38 @@ def enter(s,d,setup=None,btc=None):
     algo_close(s,d,"TAKE_PROFIT_MARKET",tp,close_position=True)
     # V2.1: keep ONE exchange-side protective STOP only. Profit targets are managed
     # by manage() from live leveraged ROI. This prevents -4045 max algo/stop-order saturation.
-    details = (setup or {}).get("details","")
-entry_rsi = None
-entry_vol = None
-entry_buy = None
+        details = (setup or {}).get("details","")
+    entry_rsi = None
+    entry_vol = None
+    entry_buy = None
 
-try:
-    for part in details.split():
-        if part.startswith("rsi="):
-            entry_rsi = float(part.split("=")[1])
-        elif part.startswith("vol="):
-            entry_vol = float(part.split("=")[1])
-        elif part.startswith("buy="):
-            entry_buy = float(part.split("=")[1])
-except:
-    pass
+    try:
+        for part in details.split():
+            if part.startswith("rsi="):
+                entry_rsi = float(part.split("=")[1])
+            elif part.startswith("vol="):
+                entry_vol = float(part.split("=")[1])
+            elif part.startswith("buy="):
+                entry_buy = float(part.split("=")[1])
+    except:
+        pass
 
-mine[s]={
-    "dir":d,
-    "tp1":False,
-    "tp2":False,
-    "lock_stage":0,
-    "initial_qty":abs(float(p["positionAmt"])),
-    "entry_time":int(time.time()*1000)-10000,
-    "accounted_trade_ids":[],
-    "entry_rsi":entry_rsi,
-    "entry_vol":entry_vol,
-    "entry_buy":entry_buy,
-    "entry_score":float((setup or {}).get("score",0)),
-    "btc_context":(btc or {}).get("bias","UNKNOWN"),
-    "btc_score":float((btc or {}).get("score",0))
-}
-save()
+    mine[s]={
+        "dir":d,
+        "tp1":False,
+        "tp2":False,
+        "lock_stage":0,
+        "initial_qty":abs(float(p["positionAmt"])),
+        "entry_time":int(time.time()*1000)-10000,
+        "accounted_trade_ids":[],
+        "entry_rsi":entry_rsi,
+        "entry_vol":entry_vol,
+        "entry_buy":entry_buy,
+        "entry_score":float((setup or {}).get("score",0)),
+        "btc_context":(btc or {}).get("bias","UNKNOWN"),
+        "btc_score":float((btc or {}).get("score",0))
+    }
+    save()
     sync_realized()
     msg(f"OPEN {d} {s}\nNotional: $100 | Leverage: {lev}x\nEntry: {ep}\nProfit Lock: +30->SL -25 | +50->BE | +75->SL +25 | TP1 +100% (50%, SL +50) | TP2 +150% (25%, SL +100) | TP3 +200% final")
 def close_all(reason):
@@ -387,11 +387,23 @@ def record_closed_trade(s, st):
         elif stage>=1: reason="PROTECTED_-25_STOP_OR_EXTERNAL"
         elif net<0: reason="INITIAL_SL_OR_EXTERNAL"
         d=_report_load()
-        d["closed"].append({
-            "symbol":s,"side":st.get("dir",""),"net":net,
-            "realized":realized,"commission":commission,
-            "exit_price":exit_px,"duration_sec":duration,
-            "reason":reason,"lock_stage":stage,"time":last_time
+                d["closed"].append({
+            "symbol":s,
+            "side":st.get("dir",""),
+            "net":net,
+            "realized":realized,
+            "commission":commission,
+            "exit_price":exit_px,
+            "duration_sec":duration,
+            "reason":reason,
+            "lock_stage":stage,
+            "time":last_time,
+            "entry_rsi":st.get("entry_rsi"),
+            "entry_vol":st.get("entry_vol"),
+            "entry_buy":st.get("entry_buy"),
+            "entry_score":st.get("entry_score"),
+            "btc_context":st.get("btc_context","UNKNOWN"),
+            "btc_score":st.get("btc_score")
         })
         _report_save(d)
         logging.info("%s EXIT DIAG | reason=%s | exit=%s | realized=%.4f | fees=%.4f | net=%.4f | duration=%.0fs",
@@ -742,7 +754,7 @@ def scan():
         if opened>=limit:break
         if s in used or s in mine:continue
         try:
-            enter(s,setup["side"])
+            enter(s,setup["side"],setup,ctx)
             # enter() writes mine only after a successful protected entry.
             if s in mine:
                 opened+=1; entries_this_candle+=1; used.add(s); save()
