@@ -556,6 +556,8 @@ def long_engine(s,btc):
     e55=float(pd.Series(c).ewm(span=55,adjust=False).mean().iloc[-1])
     tp=(h+l+c)/3; vwap=float(np.sum(tp[-20:]*v[-20:])/max(np.sum(v[-20:]),1e-12))
     r=rsi_last(c); vr=float(v[-1]/max(np.mean(v[-20:]),1e-12))
+    if r > 70:
+    return None
     buy=float(np.sum(tb[-3:])/max(np.sum(v[-3:]),1e-12))
     prior_high=float(np.max(h[-12:-2]))
     choch=c[-1]>prior_high or (c[-1]>e21 and c[-2]<=e21)
