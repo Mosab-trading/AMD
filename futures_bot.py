@@ -225,7 +225,7 @@ def close(s,p,pct,reason):
     time.sleep(.35)
     sync_realized()
     msg(f"{s} {reason}\nPnL booked from Binance trade history")
-def enter(s,d):
+def enter(s,d,setup=None,btc=None):
     if s in mine:return
     ps=positions()
     # A bot-owned position at breakeven or better (lock_stage >= 2) no longer
@@ -246,9 +246,38 @@ def enter(s,d):
     algo_close(s,d,"TAKE_PROFIT_MARKET",tp,close_position=True)
     # V2.1: keep ONE exchange-side protective STOP only. Profit targets are managed
     # by manage() from live leveraged ROI. This prevents -4045 max algo/stop-order saturation.
-    mine[s]={"dir":d,"tp1":False,"tp2":False,"lock_stage":0,
-             "initial_qty":abs(float(p["positionAmt"])),"entry_time":int(time.time()*1000)-10000,
-             "accounted_trade_ids":[]}; save()
+    details = (setup or {}).get("details","")
+entry_rsi = None
+entry_vol = None
+entry_buy = None
+
+try:
+    for part in details.split():
+        if part.startswith("rsi="):
+            entry_rsi = float(part.split("=")[1])
+        elif part.startswith("vol="):
+            entry_vol = float(part.split("=")[1])
+        elif part.startswith("buy="):
+            entry_buy = float(part.split("=")[1])
+except:
+    pass
+
+mine[s]={
+    "dir":d,
+    "tp1":False,
+    "tp2":False,
+    "lock_stage":0,
+    "initial_qty":abs(float(p["positionAmt"])),
+    "entry_time":int(time.time()*1000)-10000,
+    "accounted_trade_ids":[],
+    "entry_rsi":entry_rsi,
+    "entry_vol":entry_vol,
+    "entry_buy":entry_buy,
+    "entry_score":float((setup or {}).get("score",0)),
+    "btc_context":(btc or {}).get("bias","UNKNOWN"),
+    "btc_score":float((btc or {}).get("score",0))
+}
+save()
     sync_realized()
     msg(f"OPEN {d} {s}\nNotional: $100 | Leverage: {lev}x\nEntry: {ep}\nProfit Lock: +30->SL -25 | +50->BE | +75->SL +25 | TP1 +100% (50%, SL +50) | TP2 +150% (25%, SL +100) | TP3 +200% final")
 def close_all(reason):
