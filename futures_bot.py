@@ -464,7 +464,62 @@ def maybe_hundred_trade_report():
         f"{k}: {v}" for k,v in loss_symbols.most_common(10)
     ) or "None"
 
-    report=(
+    # ---- ENTRY DIAGNOSTICS ----
+    def avg_field(data,key):
+        vals=[]
+        for x in data:
+            v=x.get(key)
+            if v is not None:
+                try:
+                    vals.append(float(v))
+                except:
+                    pass
+        return sum(vals)/len(vals) if vals else None
+
+    def fmt_avg(v):
+        return "N/A" if v is None else f"{v:.2f}"
+
+    win_rsi=avg_field(wins,"entry_rsi")
+    loss_rsi=avg_field(losses,"entry_rsi")
+
+    win_vol=avg_field(wins,"entry_vol")
+    loss_vol=avg_field(losses,"entry_vol")
+
+    win_buy=avg_field(wins,"entry_buy")
+    loss_buy=avg_field(losses,"entry_buy")
+
+    win_score=avg_field(wins,"entry_score")
+    loss_score=avg_field(losses,"entry_score")
+
+    win_btc_score=avg_field(wins,"btc_score")
+    loss_btc_score=avg_field(losses,"btc_score")
+
+    btc_contexts={}
+    for context in ("LONG","SHORT","NEUTRAL","UNKNOWN"):
+        context_rows=[x for x in batch if x.get("btc_context","UNKNOWN")==context]
+        if not context_rows:
+            continue
+
+        context_wins=[x for x in context_rows if x.get("net",0)>0]
+        context_losses=[x for x in context_rows if x.get("net",0)<0]
+        context_net=sum(x.get("net",0) for x in context_rows)
+        context_wr=100*len(context_wins)/len(context_rows)
+
+        btc_contexts[context]={
+            "trades":len(context_rows),
+            "wins":len(context_wins),
+            "losses":len(context_losses),
+            "wr":context_wr,
+            "net":context_net
+        }
+
+    btc_text="\n".join(
+        f"{k}: Trades {v['trades']} | W {v['wins']} | L {v['losses']} | "
+        f"WR {v['wr']:.1f}% | Net ${v['net']:.2f}"
+        for k,v in btc_contexts.items()
+    ) or "No BTC context data"
+
+    report1=(
         f"100-TRADE FULL DIAGNOSTIC REPORT\n\n"
 
         f"TRADES\n"
@@ -498,12 +553,29 @@ def maybe_hundred_trade_report():
 
         f"LOSS DIAGNOSTICS\n"
         f"Loss/Exit causes: {reason_text}\n"
-        f"Most repeated losing symbols: {loss_symbol_text}\n\n"
-
-        f"NOTE: diagnostic report only; strategy and trade management unchanged."
+        f"Most repeated losing symbols: {loss_symbol_text}"
     )
 
-    msg(report,bal=False)
+    report2=(
+        f"100-TRADE ENTRY ANALYSIS\n\n"
+
+        f"WINNERS vs LOSERS\n"
+        f"RSI: {fmt_avg(win_rsi)} vs {fmt_avg(loss_rsi)}\n"
+        f"Volume Ratio: {fmt_avg(win_vol)} vs {fmt_avg(loss_vol)}\n"
+        f"Buy Ratio: {fmt_avg(win_buy)} vs {fmt_avg(loss_buy)}\n"
+        f"Entry Score: {fmt_avg(win_score)} vs {fmt_avg(loss_score)}\n"
+        f"BTC Score: {fmt_avg(win_btc_score)} vs {fmt_avg(loss_btc_score)}\n\n"
+
+        f"BTC CONTEXT PERFORMANCE\n"
+        f"{btc_text}\n\n"
+
+        f"NOTE: diagnostic comparison only; "
+        f"strategy, entries, exits, SL and TP are unchanged."
+    )
+
+    msg(report1,bal=False)
+    msg(report2,bal=False)
+
     _report_save({"closed":rows[REPORT_EVERY_TRADES:]})
 
 def manage():
