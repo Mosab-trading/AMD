@@ -387,7 +387,7 @@ def record_closed_trade(s, st):
         elif stage>=1: reason="PROTECTED_-25_STOP_OR_EXTERNAL"
         elif net<0: reason="INITIAL_SL_OR_EXTERNAL"
         d=_report_load()
-            d["closed"].append({
+        d["closed"].append({
             "symbol":s,
             "side":st.get("dir",""),
             "net":net,
