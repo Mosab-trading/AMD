@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V3.1-FLOW-TOP10-LONG-RED-15M-COOLDOWN"
+BOT_VERSION="V3.2-FLOW-LONG-RED-3M-CONFIRM-15M-COOLDOWN"
 TF="15m"; NOTIONAL=float(os.getenv("POSITION_NOTIONAL_USDT","100")); TARGET_LEV=int(os.getenv("TARGET_LEVERAGE","20"))
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -144,6 +144,7 @@ FLOW_RADAR_STATE_URL=os.getenv("FLOW_RADAR_STATE_URL","").strip()
 FLOW_RADAR_MAX_AGE=float(os.getenv("FLOW_RADAR_MAX_AGE","120"))
 PREMOVE_MAX_AGE=float(os.getenv("PREMOVE_MAX_AGE","45"))
 ENTRY_CHECK_SECONDS=float(os.getenv("ENTRY_CHECK_SECONDS","15"))
+RED_CONFIRM_SECONDS=float(os.getenv("RED_CONFIRM_SECONDS","180"))
 
 def flow_radar_state():
     if not FLOW_RADAR_STATE_URL: return None
@@ -303,7 +304,7 @@ def main():
     exchange_info(); caps=leverage_caps()
     state=load_monitor_state()
     msg(f"LIVE FLOW LONG BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | LONG only | NO MAX POSITIONS\nFlow Top-10 EARLY_LONG_WATCH entries | RED -> CLOSE ALL",bal=False)
-    red_latched=False; last_monitor=0; last_entry_check=0; red_block_until=0
+    red_latched=False; last_monitor=0; last_entry_check=0; red_block_until=0; red_since=0
     while True:
         try:
             now=time.time()
@@ -312,17 +313,26 @@ def main():
             d=flow_radar_state()
             regime=str(d.get("regime","")).upper() if d else ""
             if d and regime=="RED":
-                # Every RED blocks entries through the end of the CURRENT 15m candle.
-                # If RED persists into a new candle, this extends the block to that candle's end.
-                candle_end=(int(now)//900+1)*900
-                if candle_end>red_block_until:
-                    red_block_until=candle_end
-                    logging.info("RED 15M ENTRY BLOCK until %s",time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(red_block_until)))
-                if (not red_latched) or positions():
-                    if close_all_account_positions("FLOW RADAR RED"):
-                        red_latched=True
-                        state=load_monitor_state(); state["peak_portfolio_pnl"]=0.0; save_monitor_state(state)
+                if not red_since:
+                    red_since=now
+                    logging.warning("RED CANDIDATE started | waiting %.0fs confirmation",RED_CONFIRM_SECONDS)
+                held=now-red_since
+                if held < RED_CONFIRM_SECONDS:
+                    logging.info("RED CONFIRMING | %.0f/%.0fs | positions remain open",held,RED_CONFIRM_SECONDS)
+                else:
+                    # Only a continuously confirmed RED may close positions and start the 15m re-entry block.
+                    candle_end=(int(now)//900+1)*900
+                    if candle_end>red_block_until:
+                        red_block_until=candle_end
+                        logging.info("RED CONFIRMED %.0fs | 15M ENTRY BLOCK until %s",held,time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(red_block_until)))
+                    if (not red_latched) or positions():
+                        if close_all_account_positions(f"FLOW RADAR RED CONFIRMED {int(RED_CONFIRM_SECONDS)}s"):
+                            red_latched=True
+                            state=load_monitor_state(); state["peak_portfolio_pnl"]=0.0; save_monitor_state(state)
             elif d:
+                if red_since:
+                    logging.info("RED CANDIDATE cleared after %.0fs | no close unless confirmation completed",now-red_since)
+                    red_since=0
                 if red_latched:
                     red_latched=False
                     msg(f"FLOW RADAR RED CLEARED -> {regime} | WAITING FOR CURRENT 15M CANDLE TO CLOSE",bal=False)
