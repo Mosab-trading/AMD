@@ -176,8 +176,14 @@ def leverage_caps():
     except Exception as e: logging.warning("leverage bracket load failed: %s",e)
     return out
 
+LEVERAGE_SET_CACHE={}
 def set_leverage(s,lev):
-    return signed("POST","/fapi/v1/leverage",{"symbol":s,"leverage":int(lev)})
+    lev=int(lev)
+    if LEVERAGE_SET_CACHE.get(s)==lev:
+        return {"symbol":s,"leverage":lev,"cached":True}
+    r=signed("POST","/fapi/v1/leverage",{"symbol":s,"leverage":lev})
+    LEVERAGE_SET_CACHE[s]=lev
+    return r
 
 def mark_price(s):
     return float(pub("/fapi/v1/premiumIndex",{"symbol":s})["markPrice"])
@@ -189,8 +195,13 @@ def open_flow_long(s,cap):
     if qty<=0 or qty < float(meta[s].get("min",0) or 0):
         raise RuntimeError(f"{s}: notional below minimum quantity")
     o=market(s,"BUY",qty,False)
+    # Return a complete position-like snapshot so the local cache is safe until
+    # the next Binance positionRisk refresh. RESULT orders normally include avgPrice.
+    ep=float(o.get("avgPrice") or o.get("price") or px)
+    filled=float(o.get("executedQty") or qty)
+    snap={"symbol":s,"positionAmt":str(filled),"entryPrice":str(ep),"leverage":str(lev),"unRealizedProfit":"0"}
     msg(f"🟢 FLOW LONG OPENED | {s} | notional≈USD {NOTIONAL:.0f} | leverage={lev}x | margin≈USD {NOTIONAL/lev:.2f}",bal=False)
-    return o
+    return snap
 
 def open_flow_short(s,cap):
     lev=max(1,min(TARGET_LEV,int(cap or TARGET_LEV)))
@@ -470,10 +481,10 @@ def main():
                             if avail < need:
                                 logging.info("ENTRY WAIT %s | available margin $%.2f < required buffer $%.2f",s,avail,need)
                                 break
-                            open_flow_long(s,caps.get(s,TARGET_LEV))
+                            newp=open_flow_long(s,caps.get(s,TARGET_LEV))
                             avail=max(0.0,avail-(NOTIONAL/lev))
-                            ps[s]={"positionAmt":"1"}
-                            ps_cache[s]={"positionAmt":"1"}
+                            ps[s]=newp
+                            ps_cache[s]=newp
                         except Exception as ex:
                             logging.warning("ENTRY SKIP %s: %s",s,ex)
 
