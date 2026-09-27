@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V3.7-FLOW-LONG-ROI20-RED16S-API-MARGIN-FIX"
+BOT_VERSION="V3.8-FLOW-LONG-ROI20-RED16S-API-RATELIMIT-FIX"
 TF="15m"; NOTIONAL=float(os.getenv("POSITION_NOTIONAL_USDT","100")); TARGET_LEV=int(os.getenv("TARGET_LEVERAGE","20"))
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -223,34 +223,55 @@ def flow_radar_red():
     d=flow_radar_state()
     return bool(d and str(d.get("regime","")).upper()=="RED")
 
-def close_all_account_positions(reason):
-    """Emergency protection: close EVERY currently open Binance Futures position.
-    Uses reduceOnly market orders and retries. No new exposure can be created here.
+def close_all_account_positions(reason,ps=None):
+    """Emergency protection: close every position from one account snapshot.
+    Avoid per-symbol positionRisk polling; verify all closes with one bulk snapshot.
     """
-    ps=positions()
+    if ps is None: ps=positions()
     if not ps:
         msg(f"{reason} | No open positions",bal=False); return True
-    failed=[]
-    for s,p in list(ps.items()):
+    for s in list(ps):
         try: cancel_algo(s)
         except Exception: pass
+    failed=[]
     for s,p in list(ps.items()):
-        ok=False
-        for attempt in range(1,4):
+        try:
+            amt=float(p["positionAmt"])
+            if not amt: continue
+            side="SELL" if amt>0 else "BUY"
+            market(s,side,abs(amt),True)
+            time.sleep(.12)
+        except Exception as e:
+            logging.error("%s emergency close order failed: %s",s,e)
+            failed.append(s)
+    time.sleep(.75)
+    try:
+        remaining=positions()
+    except Exception as e:
+        logging.error("RED bulk close verification failed: %s",e)
+        remaining={}
+    still=sorted(set(ps) & set(remaining))
+    retry=sorted(set(failed) | set(still))
+    if retry:
+        logging.warning("RED CLOSE RETRY | %d positions: %s",len(retry),", ".join(retry))
+        for s in retry:
+            p=remaining.get(s) or ps.get(s)
             try:
-                live=pos(s)
-                if not live: ok=True; break
-                amt=abs(float(live["positionAmt"]))
-                side="SELL" if float(live["positionAmt"])>0 else "BUY"
-                market(s,side,amt,True)
-                time.sleep(.35)
-                if not pos(s): ok=True; break
+                amt=float(p["positionAmt"])
+                if not amt: continue
+                market(s,"SELL" if amt>0 else "BUY",abs(amt),True)
+                time.sleep(.18)
             except Exception as e:
-                logging.error("%s emergency close attempt %d/3: %s",s,attempt,e)
-                time.sleep(1)
-        if not ok: failed.append(s)
-    if failed:
-        msg("RED CLOSE INCOMPLETE | still open: "+", ".join(failed),bal=False)
+                logging.error("%s emergency close retry failed: %s",s,e)
+        time.sleep(.75)
+        try:
+            remaining=positions()
+            still=sorted(set(ps) & set(remaining))
+        except Exception as e:
+            logging.error("RED final bulk verification failed: %s",e)
+            still=retry
+    if still:
+        msg("RED CLOSE INCOMPLETE | still open: "+", ".join(still),bal=False)
         return False
     msg(f"🔴 {reason} | ALL FUTURES POSITIONS CLOSED",bal=False)
     return True
@@ -379,8 +400,8 @@ def main():
                     if candle_end>red_block_until:
                         red_block_until=candle_end
                         logging.info("RED CONFIRMED %.0fs | 15M ENTRY BLOCK until %s",held,time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(red_block_until)))
-                    if (not red_latched) or positions():
-                        if close_all_account_positions(f"FLOW RADAR RED CONFIRMED {int(RED_CONFIRM_SECONDS)}s"):
+                    if (not red_latched) or ps:
+                        if close_all_account_positions(f"FLOW RADAR RED CONFIRMED {int(RED_CONFIRM_SECONDS)}s",ps):
                             red_latched=True
                             state=load_monitor_state(); state["peak_portfolio_pnl"]=0.0; save_monitor_state(state)
             elif d:
