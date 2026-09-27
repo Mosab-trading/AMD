@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V3.2-FLOW-LONG-RED-3M-CONFIRM-15M-COOLDOWN"
+BOT_VERSION="V3.3-FLOW-LONG-ROI10-SHORT-EXIT"
 TF="15m"; NOTIONAL=float(os.getenv("POSITION_NOTIONAL_USDT","100")); TARGET_LEV=int(os.getenv("TARGET_LEVERAGE","20"))
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -145,6 +145,7 @@ FLOW_RADAR_MAX_AGE=float(os.getenv("FLOW_RADAR_MAX_AGE","120"))
 PREMOVE_MAX_AGE=float(os.getenv("PREMOVE_MAX_AGE","45"))
 ENTRY_CHECK_SECONDS=float(os.getenv("ENTRY_CHECK_SECONDS","15"))
 RED_CONFIRM_SECONDS=float(os.getenv("RED_CONFIRM_SECONDS","180"))
+ROI_ARM_THRESHOLD=float(os.getenv("ROI_ARM_THRESHOLD","10"))
 
 def flow_radar_state():
     if not FLOW_RADAR_STATE_URL: return None
@@ -299,12 +300,54 @@ def monitor_snapshot(state):
     save_monitor_state(state)
     return state
 
+def close_position_reduce_only(s,p,reason):
+    try:
+        amt=float(p["positionAmt"])
+        if not amt: return True
+        cancel_algo(s)
+        side="SELL" if amt>0 else "BUY"
+        market(s,side,abs(amt),True)
+        time.sleep(.35)
+        if not pos(s):
+            msg(f"🟠 FLOW EXIT | {s} | {reason}",bal=False)
+            return True
+    except Exception as e:
+        logging.error("FLOW EXIT failed %s: %s",s,e)
+    return False
+
+def short_watch_symbols(d):
+    now=time.time(); pts=float(d.get("premove_ts",0) or 0)
+    if not pts or max(0,now-pts)>PREMOVE_MAX_AGE: return set()
+    return {str(q.get("symbol","")).upper() for q in (d.get("top10",[]) or [])
+            if str(q.get("side","")).upper()=="SHORT"
+            and str(q.get("status","")).upper()=="EARLY_SHORT_WATCH"}
+
+def manage_roi_short_exits(d,armed):
+    ps=positions()
+    live=set(ps)
+    for s in list(armed):
+        if s not in live: armed.discard(s)
+    for s,p in ps.items():
+        if float(p["positionAmt"])<=0: continue
+        r=roi(p)
+        if r>=ROI_ARM_THRESHOLD and s not in armed:
+            armed.add(s)
+            logging.info("ROI EXIT ARMED | %s reached %.2f%% >= %.2f%%",s,r,ROI_ARM_THRESHOLD)
+    shorts=short_watch_symbols(d)
+    for s in list(armed & shorts):
+        p=ps.get(s)
+        if p and float(p["positionAmt"])>0:
+            r=roi(p)
+            if close_position_reduce_only(s,p,f"previously reached +{ROI_ARM_THRESHOLD:.0f}% ROI, now EARLY_SHORT_WATCH | current ROI={r:.2f}%"):
+                armed.discard(s)
+    return armed
+
 def main():
     if not KEY or not SECRET: raise RuntimeError("Missing Binance LIVE API keys")
     exchange_info(); caps=leverage_caps()
     state=load_monitor_state()
     msg(f"LIVE FLOW LONG BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | LONG only | NO MAX POSITIONS\nFlow Top-10 EARLY_LONG_WATCH entries | RED -> CLOSE ALL",bal=False)
-    red_latched=False; last_monitor=0; last_entry_check=0; red_block_until=0; red_since=0
+    red_latched=False; last_monitor=0; last_entry_check=0; red_block_until=0; red_since=0; roi10_armed=set()
     while True:
         try:
             now=time.time()
@@ -312,6 +355,8 @@ def main():
                 state=monitor_snapshot(state); last_monitor=now
             d=flow_radar_state()
             regime=str(d.get("regime","")).upper() if d else ""
+            if d and regime!="RED":
+                roi10_armed=manage_roi_short_exits(d,roi10_armed)
             if d and regime=="RED":
                 if not red_since:
                     red_since=now
