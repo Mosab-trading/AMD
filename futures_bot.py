@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V3.4-FLOW-LONG-ROI10-SHORT-EXIT-RED60S"
+BOT_VERSION="V3.5-FLOW-LONG-ROI20-SHORT-EXIT-RED60S"
 TF="15m"; NOTIONAL=float(os.getenv("POSITION_NOTIONAL_USDT","100")); TARGET_LEV=int(os.getenv("TARGET_LEVERAGE","20"))
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -145,7 +145,7 @@ FLOW_RADAR_MAX_AGE=float(os.getenv("FLOW_RADAR_MAX_AGE","120"))
 PREMOVE_MAX_AGE=float(os.getenv("PREMOVE_MAX_AGE","45"))
 ENTRY_CHECK_SECONDS=float(os.getenv("ENTRY_CHECK_SECONDS","15"))
 RED_CONFIRM_SECONDS=float(os.getenv("RED_CONFIRM_SECONDS","60"))
-ROI_ARM_THRESHOLD=float(os.getenv("ROI_ARM_THRESHOLD","10"))
+ROI_ARM_THRESHOLD=float(os.getenv("ROI_ARM_THRESHOLD","20"))
 
 def flow_radar_state():
     if not FLOW_RADAR_STATE_URL: return None
