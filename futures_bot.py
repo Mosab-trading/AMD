@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V3.8-FLOW-LONG-ROI20-RED16S-API-RATELIMIT-FIX"
+BOT_VERSION="V3.9-FLOW-LONG-ROI20-RED16S-POSCACHE15S"
 TF="15m"; NOTIONAL=float(os.getenv("POSITION_NOTIONAL_USDT","100")); TARGET_LEV=int(os.getenv("TARGET_LEVERAGE","20"))
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -377,10 +377,16 @@ def main():
     state=load_monitor_state()
     msg(f"LIVE FLOW LONG BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | LONG only | NO MAX POSITIONS\nFlow Top-10 EARLY_LONG_WATCH entries | RED -> CLOSE ALL",bal=False)
     red_latched=False; last_monitor=0; last_entry_check=0; red_block_until=0; red_since=0; roi10_armed=set()
+    ps_cache={}; ps_cache_ts=0.0; POSITION_CACHE_SECONDS=15.0
     while True:
         try:
             now=time.time()
-            ps=positions()
+            # Position snapshot is relatively expensive on Binance. Reuse it for 15s
+            # while Flow/RED is still checked every 5s.
+            if (not ps_cache_ts) or (now-ps_cache_ts>=POSITION_CACHE_SECONDS):
+                ps_cache=positions()
+                ps_cache_ts=now
+            ps=dict(ps_cache)
             if now-last_monitor>=MONITOR_INTERVAL:
                 state=monitor_snapshot(state,ps); last_monitor=now
             d=flow_radar_state()
@@ -402,6 +408,7 @@ def main():
                         logging.info("RED CONFIRMED %.0fs | 15M ENTRY BLOCK until %s",held,time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(red_block_until)))
                     if (not red_latched) or ps:
                         if close_all_account_positions(f"FLOW RADAR RED CONFIRMED {int(RED_CONFIRM_SECONDS)}s",ps):
+                            ps_cache={}; ps_cache_ts=time.time()
                             red_latched=True
                             state=load_monitor_state(); state["peak_portfolio_pnl"]=0.0; save_monitor_state(state)
             elif d:
@@ -428,6 +435,7 @@ def main():
                             open_flow_long(s,caps.get(s,TARGET_LEV))
                             avail=max(0.0,avail-(NOTIONAL/lev))
                             ps[s]={"positionAmt":"1"}
+                            ps_cache[s]={"positionAmt":"1"}
                         except Exception as ex:
                             logging.warning("ENTRY SKIP %s: %s",s,ex)
             time.sleep(5)
