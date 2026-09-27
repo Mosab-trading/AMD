@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V3.0-FLOW-TOP10-LONG-LIVE-RED-CLOSE"
+BOT_VERSION="V3.1-FLOW-TOP10-LONG-RED-15M-COOLDOWN"
 TF="15m"; NOTIONAL=float(os.getenv("POSITION_NOTIONAL_USDT","100")); TARGET_LEV=int(os.getenv("TARGET_LEVERAGE","20"))
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -303,14 +303,21 @@ def main():
     exchange_info(); caps=leverage_caps()
     state=load_monitor_state()
     msg(f"LIVE FLOW LONG BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | LONG only | NO MAX POSITIONS\nFlow Top-10 EARLY_LONG_WATCH entries | RED -> CLOSE ALL",bal=False)
-    red_latched=False; last_monitor=0; last_entry_check=0
+    red_latched=False; last_monitor=0; last_entry_check=0; red_block_until=0
     while True:
         try:
             now=time.time()
             if now-last_monitor>=MONITOR_INTERVAL:
                 state=monitor_snapshot(state); last_monitor=now
             d=flow_radar_state()
-            if d and str(d.get("regime","")).upper()=="RED":
+            regime=str(d.get("regime","")).upper() if d else ""
+            if d and regime=="RED":
+                # Every RED blocks entries through the end of the CURRENT 15m candle.
+                # If RED persists into a new candle, this extends the block to that candle's end.
+                candle_end=(int(now)//900+1)*900
+                if candle_end>red_block_until:
+                    red_block_until=candle_end
+                    logging.info("RED 15M ENTRY BLOCK until %s",time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(red_block_until)))
                 if (not red_latched) or positions():
                     if close_all_account_positions("FLOW RADAR RED"):
                         red_latched=True
@@ -318,8 +325,10 @@ def main():
             elif d:
                 if red_latched:
                     red_latched=False
-                    msg(f"FLOW RADAR RED CLEARED -> {str(d.get('regime','')).upper()} | LONG ENTRIES ENABLED",bal=False)
-                if now-last_entry_check>=ENTRY_CHECK_SECONDS:
+                    msg(f"FLOW RADAR RED CLEARED -> {regime} | WAITING FOR CURRENT 15M CANDLE TO CLOSE",bal=False)
+                if now < red_block_until:
+                    logging.info("ENTRY BLOCKED after RED | %.0fs until next 15m candle",red_block_until-now)
+                elif now-last_entry_check>=ENTRY_CHECK_SECONDS:
                     last_entry_check=now
                     ps=positions()
                     for q in eligible_flow_longs(d):
