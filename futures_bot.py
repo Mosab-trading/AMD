@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V4.0-FLOW-LONG-SHORT-GREEN-SHORT-EXIT-RED16S"
+BOT_VERSION="V4.1-FLOW-LONG-ONLY-GREEN-SHORT-EXIT-RED16S"
 TF="15m"; NOTIONAL=float(os.getenv("POSITION_NOTIONAL_USDT","100")); TARGET_LEV=int(os.getenv("TARGET_LEVERAGE","20"))
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -402,7 +402,7 @@ def main():
     if not KEY or not SECRET: raise RuntimeError("Missing Binance LIVE API keys")
     exchange_info(); caps=leverage_caps()
     state=load_monitor_state()
-    msg(f"LIVE FLOW TWO-WAY BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | LONG + SHORT | NO MAX POSITIONS\nFlow LONG/SHORT scanner entries | GREEN -> CLOSE SHORTS | RED -> CLOSE ALL",bal=False)
+    msg(f"LIVE FLOW LONG BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | LONG only | NO MAX POSITIONS\nFlow LONG scanner entries | scanner still reports SHORT | GREEN -> CLOSE existing SHORTS | RED -> CLOSE ALL",bal=False)
     red_latched=False; last_monitor=0; last_entry_check=0; red_block_until=0; red_since=0; roi10_armed=set(); green_latched=False
     ps_cache={}; ps_cache_ts=0.0; POSITION_CACHE_SECONDS=15.0
     while True:
@@ -476,23 +476,7 @@ def main():
                             ps_cache[s]={"positionAmt":"1"}
                         except Exception as ex:
                             logging.warning("ENTRY SKIP %s: %s",s,ex)
-                    # SHORT entries are allowed only when the global regime is not GREEN.
-                    if regime!="GREEN":
-                        for q in eligible_flow_shorts(d):
-                            s=str(q.get("symbol","")).upper()
-                            if not s or s in ps or s not in meta: continue
-                            try:
-                                lev=max(1,min(TARGET_LEV,int(caps.get(s,TARGET_LEV) or TARGET_LEV)))
-                                need=(NOTIONAL/lev)*1.10
-                                if avail < need:
-                                    logging.info("SHORT ENTRY WAIT %s | available margin $%.2f < required buffer $%.2f",s,avail,need)
-                                    break
-                                open_flow_short(s,caps.get(s,TARGET_LEV))
-                                avail=max(0.0,avail-(NOTIONAL/lev))
-                                ps[s]={"positionAmt":"-1"}
-                                ps_cache[s]={"positionAmt":"-1"}
-                            except Exception as ex:
-                                logging.warning("SHORT ENTRY SKIP %s: %s",s,ex)
+
             time.sleep(5)
         except Exception as ex:
             logging.exception(ex); time.sleep(5)
