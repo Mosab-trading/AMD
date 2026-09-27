@@ -141,7 +141,7 @@ MONITOR_STATE="portfolio_monitor_state.json"
 MONITOR_LOG="portfolio_monitor.jsonl"
 MONITOR_INTERVAL=int(os.getenv("MONITOR_INTERVAL_SECONDS","30"))
 FLOW_RADAR_STATE_URL=os.getenv("FLOW_RADAR_STATE_URL","").strip()
-FLOW_RADAR_MAX_AGE=float(os.getenv("FLOW_RADAR_MAX_AGE","15"))
+FLOW_RADAR_MAX_AGE=float(os.getenv("FLOW_RADAR_MAX_AGE","120"))
 
 # This program intentionally has NO entry/open-position function.
 # Its only trading action is reduce-only CLOSE ALL after a confirmed RED signal.
@@ -178,8 +178,15 @@ def flow_radar_red():
         r.raise_for_status()
         d=r.json()
         ts=float(d.get("ts",0) or 0)
-        if not ts or time.time()-ts>FLOW_RADAR_MAX_AGE:
-            logging.warning("FLOW RADAR RED GUARD stale state; ignoring")
+        # Flow Radar refreshes its public state after completing a reporting cycle,
+        # which can take longer than the old 15-second freshness window.
+        # Accept a recent state for up to FLOW_RADAR_MAX_AGE (default 120s),
+        # while still failing safe if the state is genuinely stale/unavailable.
+        age=time.time()-ts if ts else float("inf")
+        if age<0:
+            age=0.0  # tolerate small host clock skew
+        if not ts or age>FLOW_RADAR_MAX_AGE:
+            logging.warning("FLOW RADAR RED GUARD stale state age=%.1fs max=%.1fs; ignoring",age,FLOW_RADAR_MAX_AGE)
             return False
         return str(d.get("regime","")).upper()=="RED"
     except Exception as e:
