@@ -168,8 +168,9 @@ def append_snapshot(row):
         f.write(json.dumps(row,separators=(",",":"))+"\n")
 
 def flow_radar_red():
-    """Consume Flow Radar's own RED result exactly as the prior live RED Guard did.
-    Missing/stale/unavailable radar state is fail-safe: no forced close.
+    """Consume Flow Radar RED safely.
+    heartbeat_ts proves the service is alive; valid/ts prove the regime calculation is usable.
+    Missing, warming, invalid, stale or unavailable state is fail-safe: no forced close.
     """
     if not FLOW_RADAR_STATE_URL:
         return False
@@ -177,16 +178,26 @@ def flow_radar_red():
         r=requests.get(FLOW_RADAR_STATE_URL,timeout=5)
         r.raise_for_status()
         d=r.json()
+        now=time.time()
+
+        heartbeat=float(d.get("heartbeat_ts",d.get("ts",0)) or 0)
+        heartbeat_age=now-heartbeat if heartbeat else float("inf")
+        if heartbeat_age<0:
+            heartbeat_age=0.0
+        if not heartbeat or heartbeat_age>FLOW_RADAR_MAX_AGE:
+            logging.warning("FLOW RADAR RED GUARD stale heartbeat age=%.1fs max=%.1fs; ignoring",heartbeat_age,FLOW_RADAR_MAX_AGE)
+            return False
+
+        if "valid" in d and not bool(d.get("valid")):
+            logging.info("FLOW RADAR RED GUARD warming/invalid state; service heartbeat is healthy")
+            return False
+
         ts=float(d.get("ts",0) or 0)
-        # Flow Radar refreshes its public state after completing a reporting cycle,
-        # which can take longer than the old 15-second freshness window.
-        # Accept a recent state for up to FLOW_RADAR_MAX_AGE (default 120s),
-        # while still failing safe if the state is genuinely stale/unavailable.
-        age=time.time()-ts if ts else float("inf")
+        age=now-ts if ts else float("inf")
         if age<0:
-            age=0.0  # tolerate small host clock skew
+            age=0.0
         if not ts or age>FLOW_RADAR_MAX_AGE:
-            logging.warning("FLOW RADAR RED GUARD stale state age=%.1fs max=%.1fs; ignoring",age,FLOW_RADAR_MAX_AGE)
+            logging.warning("FLOW RADAR RED GUARD stale regime age=%.1fs max=%.1fs; ignoring",age,FLOW_RADAR_MAX_AGE)
             return False
         return str(d.get("regime","")).upper()=="RED"
     except Exception as e:
