@@ -8,8 +8,8 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V2.1.2-BREAKEVEN-SLOTS-MAXQTY-FIX-LIVE-NO-BASKET-50REPORT"
-TF="15m"; NOTIONAL=100.0; TARGET_LEV=20; MAX_POS=30
+BOT_VERSION="V3.0-FLOW-TOP10-LONG-LIVE-RED-CLOSE"
+TF="15m"; NOTIONAL=float(os.getenv("POSITION_NOTIONAL_USDT","100")); TARGET_LEV=int(os.getenv("TARGET_LEVERAGE","20"))
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
 BASKET=50.0; LOSS_LIMIT=100.0
@@ -142,9 +142,51 @@ MONITOR_LOG="portfolio_monitor.jsonl"
 MONITOR_INTERVAL=int(os.getenv("MONITOR_INTERVAL_SECONDS","30"))
 FLOW_RADAR_STATE_URL=os.getenv("FLOW_RADAR_STATE_URL","").strip()
 FLOW_RADAR_MAX_AGE=float(os.getenv("FLOW_RADAR_MAX_AGE","120"))
+PREMOVE_MAX_AGE=float(os.getenv("PREMOVE_MAX_AGE","45"))
+ENTRY_CHECK_SECONDS=float(os.getenv("ENTRY_CHECK_SECONDS","15"))
 
-# This program intentionally has NO entry/open-position function.
-# Its only trading action is reduce-only CLOSE ALL after a confirmed RED signal.
+def flow_radar_state():
+    if not FLOW_RADAR_STATE_URL: return None
+    try:
+        r=requests.get(FLOW_RADAR_STATE_URL,timeout=5); r.raise_for_status(); d=r.json()
+        now=time.time(); hb=float(d.get("heartbeat_ts",d.get("ts",0)) or 0)
+        if not hb or max(0,now-hb)>FLOW_RADAR_MAX_AGE or not bool(d.get("valid",False)): return None
+        ts=float(d.get("ts",0) or 0)
+        if not ts or max(0,now-ts)>FLOW_RADAR_MAX_AGE: return None
+        return d
+    except Exception as e:
+        logging.warning("FLOW RADAR STATE unavailable: %s",e); return None
+
+def leverage_caps():
+    out={}
+    try:
+        for x in signed("GET","/fapi/v1/leverageBracket"):
+            vals=[int(b.get("initialLeverage",1)) for b in x.get("brackets",[]) if b.get("initialLeverage")]
+            if vals: out[x["symbol"]]=max(vals)
+    except Exception as e: logging.warning("leverage bracket load failed: %s",e)
+    return out
+
+def set_leverage(s,lev):
+    return signed("POST","/fapi/v1/leverage",{"symbol":s,"leverage":int(lev)})
+
+def mark_price(s):
+    return float(pub("/fapi/v1/premiumIndex",{"symbol":s})["markPrice"])
+
+def open_flow_long(s,cap):
+    lev=max(1,min(TARGET_LEV,int(cap or TARGET_LEV)))
+    set_leverage(s,lev)
+    px=mark_price(s); qty=qty_ok(s,NOTIONAL/px)
+    if qty<=0 or qty < float(meta[s].get("min",0) or 0):
+        raise RuntimeError(f"{s}: notional below minimum quantity")
+    o=market(s,"BUY",qty,False)
+    msg(f"🟢 FLOW LONG OPENED | {s} | notional≈USD {NOTIONAL:.0f} | leverage={lev}x | margin≈USD {NOTIONAL/lev:.2f}",bal=False)
+    return o
+
+def eligible_flow_longs(d):
+    now=time.time(); pts=float(d.get("premove_ts",0) or 0)
+    if not pts or max(0,now-pts)>PREMOVE_MAX_AGE: return []
+    return [q for q in (d.get("top10",[]) or []) if str(q.get("side","")).upper()=="LONG" and str(q.get("status","")).upper()=="EARLY_LONG_WATCH"]
+
 
 def roi(p):
     amt=abs(float(p["positionAmt"])); ep=float(p["entryPrice"]); lev=float(p.get("leverage",20)); pnl=float(p["unRealizedProfit"])
@@ -168,41 +210,8 @@ def append_snapshot(row):
         f.write(json.dumps(row,separators=(",",":"))+"\n")
 
 def flow_radar_red():
-    """Consume Flow Radar RED safely.
-    heartbeat_ts proves the service is alive; valid/ts prove the regime calculation is usable.
-    Missing, warming, invalid, stale or unavailable state is fail-safe: no forced close.
-    """
-    if not FLOW_RADAR_STATE_URL:
-        return False
-    try:
-        r=requests.get(FLOW_RADAR_STATE_URL,timeout=5)
-        r.raise_for_status()
-        d=r.json()
-        now=time.time()
-
-        heartbeat=float(d.get("heartbeat_ts",d.get("ts",0)) or 0)
-        heartbeat_age=now-heartbeat if heartbeat else float("inf")
-        if heartbeat_age<0:
-            heartbeat_age=0.0
-        if not heartbeat or heartbeat_age>FLOW_RADAR_MAX_AGE:
-            logging.warning("FLOW RADAR RED GUARD stale heartbeat age=%.1fs max=%.1fs; ignoring",heartbeat_age,FLOW_RADAR_MAX_AGE)
-            return False
-
-        if "valid" in d and not bool(d.get("valid")):
-            logging.info("FLOW RADAR RED GUARD warming/invalid state; service heartbeat is healthy")
-            return False
-
-        ts=float(d.get("ts",0) or 0)
-        age=now-ts if ts else float("inf")
-        if age<0:
-            age=0.0
-        if not ts or age>FLOW_RADAR_MAX_AGE:
-            logging.warning("FLOW RADAR RED GUARD stale regime age=%.1fs max=%.1fs; ignoring",age,FLOW_RADAR_MAX_AGE)
-            return False
-        return str(d.get("regime","")).upper()=="RED"
-    except Exception as e:
-        logging.warning("FLOW RADAR RED GUARD unavailable: %s",e)
-        return False
+    d=flow_radar_state()
+    return bool(d and str(d.get("regime","")).upper()=="RED")
 
 def close_all_account_positions(reason):
     """Emergency protection: close EVERY currently open Binance Futures position.
@@ -291,26 +300,38 @@ def monitor_snapshot(state):
 
 def main():
     if not KEY or not SECRET: raise RuntimeError("Missing Binance LIVE API keys")
-    exchange_info()
+    exchange_info(); caps=leverage_caps()
     state=load_monitor_state()
-    msg("LIVE PORTFOLIO MONITOR + RED PROTECTION STARTED\nNO ENTRIES | NO TP/SL MANAGEMENT | monitors ALL account positions\nRED confirmed -> CLOSE ALL | slow-bleed data = RECORD ONLY",bal=False)
-    red_latched=False; last_monitor=0
+    msg(f"LIVE FLOW LONG BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | LONG only | NO MAX POSITIONS\nFlow Top-10 EARLY_LONG_WATCH entries | RED -> CLOSE ALL",bal=False)
+    red_latched=False; last_monitor=0; last_entry_check=0
     while True:
         try:
             now=time.time()
             if now-last_monitor>=MONITOR_INTERVAL:
                 state=monitor_snapshot(state); last_monitor=now
-            is_red=flow_radar_red()
-            if is_red:
+            d=flow_radar_state()
+            if d and str(d.get("regime","")).upper()=="RED":
                 if (not red_latched) or positions():
                     if close_all_account_positions("FLOW RADAR RED"):
                         red_latched=True
                         state=load_monitor_state(); state["peak_portfolio_pnl"]=0.0; save_monitor_state(state)
-            elif red_latched:
-                red_latched=False
-                msg("FLOW RADAR RED CLEARED | MONITOR CONTINUES",bal=False)
+            elif d:
+                if red_latched:
+                    red_latched=False
+                    msg(f"FLOW RADAR RED CLEARED -> {str(d.get('regime','')).upper()} | LONG ENTRIES ENABLED",bal=False)
+                if now-last_entry_check>=ENTRY_CHECK_SECONDS:
+                    last_entry_check=now
+                    ps=positions()
+                    for q in eligible_flow_longs(d):
+                        s=str(q.get("symbol","")).upper()
+                        if not s or s in ps or s not in meta: continue
+                        try:
+                            open_flow_long(s,caps.get(s,TARGET_LEV))
+                            ps=positions()
+                        except Exception as ex:
+                            logging.warning("ENTRY SKIP %s: %s",s,ex)
             time.sleep(5)
-        except Exception as e:
-            logging.exception(e); time.sleep(5)
+        except Exception as ex:
+            logging.exception(ex); time.sleep(5)
 
 if __name__=="__main__": main()
