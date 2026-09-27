@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V3.5-FLOW-LONG-ROI20-SHORT-EXIT-RED60S"
+BOT_VERSION="V3.6-FLOW-LONG-ROI20-SHORT-EXIT-API-MARGIN-FIX"
 TF="15m"; NOTIONAL=float(os.getenv("POSITION_NOTIONAL_USDT","100")); TARGET_LEV=int(os.getenv("TARGET_LEVERAGE","20"))
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -36,6 +36,14 @@ def balance():
             if x["asset"]=="USDT": return float(x["balance"])
     except: pass
     return 0
+
+def available_balance():
+    try:
+        for x in signed("GET","/fapi/v2/balance"):
+            if x["asset"]=="USDT": return float(x.get("availableBalance",0) or 0)
+    except Exception as e:
+        logging.warning("available balance check failed: %s",e)
+    return 0.0
 def trade_rows(s,start_ms=0):
     p={"symbol":s,"limit":1000}
     if start_ms:p["startTime"]=int(start_ms)
@@ -247,8 +255,8 @@ def close_all_account_positions(reason):
     msg(f"🔴 {reason} | ALL FUTURES POSITIONS CLOSED",bal=False)
     return True
 
-def monitor_snapshot(state):
-    ps=positions()
+def monitor_snapshot(state,ps=None):
+    if ps is None: ps=positions()
     now=int(time.time()*1000)
     previous=state.get("positions",{})
     current={}
@@ -322,8 +330,8 @@ def short_watch_symbols(d):
             if str(q.get("side","")).upper()=="SHORT"
             and str(q.get("status","")).upper()=="EARLY_SHORT_WATCH"}
 
-def manage_roi_short_exits(d,armed):
-    ps=positions()
+def manage_roi_short_exits(d,armed,ps=None):
+    if ps is None: ps=positions()
     live=set(ps)
     for s in list(armed):
         if s not in live: armed.discard(s)
@@ -351,12 +359,13 @@ def main():
     while True:
         try:
             now=time.time()
+            ps=positions()
             if now-last_monitor>=MONITOR_INTERVAL:
-                state=monitor_snapshot(state); last_monitor=now
+                state=monitor_snapshot(state,ps); last_monitor=now
             d=flow_radar_state()
             regime=str(d.get("regime","")).upper() if d else ""
             if d and regime!="RED":
-                roi10_armed=manage_roi_short_exits(d,roi10_armed)
+                roi10_armed=manage_roi_short_exits(d,roi10_armed,ps)
             if d and regime=="RED":
                 if not red_since:
                     red_since=now
@@ -385,13 +394,19 @@ def main():
                     logging.info("ENTRY BLOCKED after RED | %.0fs until next 15m candle",red_block_until-now)
                 elif now-last_entry_check>=ENTRY_CHECK_SECONDS:
                     last_entry_check=now
-                    ps=positions()
+                    avail=available_balance()
                     for q in eligible_flow_longs(d):
                         s=str(q.get("symbol","")).upper()
                         if not s or s in ps or s not in meta: continue
                         try:
+                            lev=max(1,min(TARGET_LEV,int(caps.get(s,TARGET_LEV) or TARGET_LEV)))
+                            need=(NOTIONAL/lev)*1.10
+                            if avail < need:
+                                logging.info("ENTRY WAIT %s | available margin $%.2f < required buffer $%.2f",s,avail,need)
+                                break
                             open_flow_long(s,caps.get(s,TARGET_LEV))
-                            ps=positions()
+                            avail=max(0.0,avail-(NOTIONAL/lev))
+                            ps[s]={"positionAmt":"1"}
                         except Exception as ex:
                             logging.warning("ENTRY SKIP %s: %s",s,ex)
             time.sleep(5)
