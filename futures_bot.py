@@ -153,6 +153,7 @@ FLOW_RADAR_MAX_AGE=float(os.getenv("FLOW_RADAR_MAX_AGE","120"))
 PREMOVE_MAX_AGE=float(os.getenv("PREMOVE_MAX_AGE","45"))
 ENTRY_CHECK_SECONDS=float(os.getenv("ENTRY_CHECK_SECONDS","15"))
 RED_CONFIRM_SECONDS=float(os.getenv("RED_CONFIRM_SECONDS","16"))
+GREEN_CONFIRM_SECONDS=float(os.getenv("GREEN_CONFIRM_SECONDS","16"))
 ROI_ARM_THRESHOLD=float(os.getenv("ROI_ARM_THRESHOLD","20"))
 
 def flow_radar_state():
@@ -210,8 +211,11 @@ def open_flow_short(s,cap):
     if qty<=0 or qty < float(meta[s].get("min",0) or 0):
         raise RuntimeError(f"{s}: notional below minimum quantity")
     o=market(s,"SELL",qty,False)
+    ep=float(o.get("avgPrice") or o.get("price") or px)
+    filled=float(o.get("executedQty") or qty)
+    snap={"symbol":s,"positionAmt":str(-filled),"entryPrice":str(ep),"leverage":str(lev),"unRealizedProfit":"0"}
     msg(f"🔴 FLOW SHORT OPENED | {s} | notional≈USD {NOTIONAL:.0f} | leverage={lev}x | margin≈USD {NOTIONAL/lev:.2f}",bal=False)
-    return o
+    return snap
 
 def eligible_flow_longs(d):
     now=time.time(); pts=float(d.get("premove_ts",0) or 0)
@@ -413,8 +417,8 @@ def main():
     if not KEY or not SECRET: raise RuntimeError("Missing Binance LIVE API keys")
     exchange_info(); caps=leverage_caps()
     state=load_monitor_state()
-    msg(f"LIVE FLOW LONG BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | LONG only | NO MAX POSITIONS\nFlow LONG scanner entries | scanner still reports SHORT | GREEN -> CLOSE existing SHORTS | RED -> CLOSE ALL",bal=False)
-    red_latched=False; last_monitor=0; last_entry_check=0; red_block_until=0; red_since=0; roi10_armed=set(); green_latched=False
+    msg(f"LIVE FLOW SHORT BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | SHORT only | NO MAX POSITIONS\nFlow SHORT scanner entries | GREEN {int(GREEN_CONFIRM_SECONDS)}s -> CLOSE SHORTS | RED {int(RED_CONFIRM_SECONDS)}s protection unchanged",bal=False)
+    red_latched=False; last_monitor=0; last_entry_check=0; red_block_until=0; red_since=0; roi10_armed=set(); green_latched=False; green_since=0
     ps_cache={}; ps_cache_ts=0.0; POSITION_CACHE_SECONDS=15.0
     while True:
         try:
@@ -431,16 +435,26 @@ def main():
             regime=str(d.get("regime","")).upper() if d else ""
             if d and regime!="RED":
                 roi10_armed=manage_roi_short_exits(d,roi10_armed,ps)
-            # GREEN is bullish market regime: immediately remove any open SHORT exposure.
+            # GREEN must persist continuously before removing SHORT exposure.
             if d and regime=="GREEN":
-                if not green_latched:
+                if not green_since:
+                    green_since=now
+                    logging.warning("GREEN CANDIDATE started | waiting %.0fs confirmation",GREEN_CONFIRM_SECONDS)
+                green_held=now-green_since
+                if green_held < GREEN_CONFIRM_SECONDS:
+                    logging.info("GREEN CONFIRMING | %.0f/%.0fs | SHORT positions remain open",green_held,GREEN_CONFIRM_SECONDS)
+                elif not green_latched:
                     closed_shorts=close_all_shorts_on_green(ps)
                     if closed_shorts:
                         for s in closed_shorts:
                             ps.pop(s,None); ps_cache.pop(s,None)
                         ps_cache_ts=time.time()
                     green_latched=True
+                    logging.info("GREEN CONFIRMED %.0fs | SHORT close completed",green_held)
             else:
+                if green_since:
+                    logging.info("GREEN CANDIDATE cleared after %.0fs | no SHORT close unless confirmation completed",now-green_since)
+                green_since=0
                 green_latched=False
             if d and regime=="RED":
                 if not red_since:
@@ -472,21 +486,23 @@ def main():
                 elif now-last_entry_check>=ENTRY_CHECK_SECONDS:
                     last_entry_check=now
                     avail=available_balance()
-                    for q in eligible_flow_longs(d):
-                        s=str(q.get("symbol","")).upper()
-                        if not s or s in ps or s not in meta: continue
-                        try:
-                            lev=max(1,min(TARGET_LEV,int(caps.get(s,TARGET_LEV) or TARGET_LEV)))
-                            need=(NOTIONAL/lev)*1.10
-                            if avail < need:
-                                logging.info("ENTRY WAIT %s | available margin $%.2f < required buffer $%.2f",s,avail,need)
-                                break
-                            newp=open_flow_long(s,caps.get(s,TARGET_LEV))
-                            avail=max(0.0,avail-(NOTIONAL/lev))
-                            ps[s]=newp
-                            ps_cache[s]=newp
-                        except Exception as ex:
-                            logging.warning("ENTRY SKIP %s: %s",s,ex)
+                    # SHORT-only mode: do not add new exposure while GREEN is being confirmed.
+                    if regime!="GREEN":
+                        for q in eligible_flow_shorts(d):
+                            s=str(q.get("symbol","")).upper()
+                            if not s or s in ps or s not in meta: continue
+                            try:
+                                lev=max(1,min(TARGET_LEV,int(caps.get(s,TARGET_LEV) or TARGET_LEV)))
+                                need=(NOTIONAL/lev)*1.10
+                                if avail < need:
+                                    logging.info("ENTRY WAIT %s | available margin $%.2f < required buffer $%.2f",s,avail,need)
+                                    break
+                                newp=open_flow_short(s,caps.get(s,TARGET_LEV))
+                                avail=max(0.0,avail-(NOTIONAL/lev))
+                                ps[s]=newp
+                                ps_cache[s]=newp
+                            except Exception as ex:
+                                logging.warning("ENTRY SKIP %s: %s",s,ex)
 
             time.sleep(5)
         except Exception as ex:
