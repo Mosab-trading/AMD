@@ -426,7 +426,7 @@ def main():
     last_monitor=0; last_entry_check=0
     red_since=0; red_latched=False
     breakeven_armed=False; trading_paused=False
-    ps_cache={}; ps_cache_ts=0.0; POSITION_CACHE_SECONDS=15.0
+    ps_cache={}; ps_cache_ts=0.0; POSITION_CACHE_SECONDS=float(os.getenv("POSITION_CACHE_SECONDS","45"))
     while True:
         try:
             now=time.time()
