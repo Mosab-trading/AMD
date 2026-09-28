@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V4.3-FLOW-LONG-ONLY-RED16-PROTECTION"
+BOT_VERSION="V4.4-FLOW-SHORT-ONLY-GREEN16-PROTECTION"
 TF="15m"; NOTIONAL=float(os.getenv("POSITION_NOTIONAL_USDT","100")); TARGET_LEV=int(os.getenv("TARGET_LEVERAGE","20"))
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -417,9 +417,9 @@ def manage_roi_short_exits(d,armed,ps=None):
     if not KEY or not SECRET: raise RuntimeError("Missing Binance LIVE API keys")
     exchange_info(); caps=leverage_caps()
     state=load_monitor_state()
-    msg(f"LIVE FLOW LONG BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | LONG ONLY | NO MAX POSITIONS\nEARLY_LONG_WATCH entries | RED {int(RED_CONFIRM_SECONDS)}s -> CLOSE LONGS + BLOCK NEW LONGS UNTIL RED CLEARS",bal=False)
-    last_monitor=0; last_entry_check=0; roi10_armed=set()
-    red_since=0; red_latched=False
+    msg(f"LIVE FLOW SHORT BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | SHORT ONLY | NO MAX POSITIONS\nEARLY_SHORT_WATCH entries | GREEN {int(GREEN_CONFIRM_SECONDS)}s -> CLOSE SHORTS + BLOCK NEW SHORTS UNTIL GREEN CLEARS",bal=False)
+    last_monitor=0; last_entry_check=0
+    green_since=0; green_latched=False
     ps_cache={}; ps_cache_ts=0.0; POSITION_CACHE_SECONDS=15.0
     while True:
         try:
@@ -432,37 +432,35 @@ def manage_roi_short_exits(d,armed,ps=None):
                 state=monitor_snapshot(state,ps); last_monitor=now
             d=flow_radar_state()
             regime=str(d.get("regime","")).upper() if d else ""
-            if d and regime!="RED":
-                roi10_armed=manage_roi_short_exits(d,roi10_armed,ps)
 
-            # RED must persist continuously for 16s before LONG exposure is closed.
-            if d and regime=="RED":
-                if not red_since:
-                    red_since=now
-                    logging.warning("RED CANDIDATE started | waiting %.0fs confirmation",RED_CONFIRM_SECONDS)
-                held=now-red_since
-                if held < RED_CONFIRM_SECONDS:
-                    logging.info("RED CONFIRMING | %.0f/%.0fs | LONG positions remain open",held,RED_CONFIRM_SECONDS)
-                elif not red_latched:
-                    closed=close_all_longs_on_red(ps)
+            # GREEN must persist continuously for 16s before SHORT exposure is closed.
+            if d and regime=="GREEN":
+                if not green_since:
+                    green_since=now
+                    logging.warning("GREEN CANDIDATE started | waiting %.0fs confirmation",GREEN_CONFIRM_SECONDS)
+                held=now-green_since
+                if held < GREEN_CONFIRM_SECONDS:
+                    logging.info("GREEN CONFIRMING | %.0f/%.0fs | SHORT positions remain open",held,GREEN_CONFIRM_SECONDS)
+                elif not green_latched:
+                    closed=close_all_shorts_on_green(ps)
                     for s in closed:
                         ps.pop(s,None); ps_cache.pop(s,None)
                     ps_cache_ts=time.time()
-                    red_latched=True
-                    msg(f"🔴 RED CONFIRMED {int(RED_CONFIRM_SECONDS)}s -> LONGS CLOSED | NEW LONGS BLOCKED",bal=False)
+                    green_latched=True
+                    msg(f"🟢 GREEN CONFIRMED {int(GREEN_CONFIRM_SECONDS)}s -> SHORTS CLOSED | NEW SHORTS BLOCKED",bal=False)
             else:
-                if red_since:
-                    logging.info("RED CANDIDATE cleared after %.0fs",now-red_since)
-                red_since=0
-                if red_latched:
-                    red_latched=False
-                    msg(f"RED CLEARED -> {regime or 'NEUTRAL'} | LONG ENTRIES ENABLED",bal=False)
+                if green_since:
+                    logging.info("GREEN CANDIDATE cleared after %.0fs",now-green_since)
+                green_since=0
+                if green_latched:
+                    green_latched=False
+                    msg(f"GREEN CLEARED -> {regime or 'NEUTRAL'} | SHORT ENTRIES ENABLED",bal=False)
 
-            # LONG ONLY: never route a SHORT order.
-            if d and regime!="RED" and not red_latched and now-last_entry_check>=ENTRY_CHECK_SECONDS:
+            # SHORT ONLY: never route a LONG order.
+            if d and regime!="GREEN" and not green_latched and now-last_entry_check>=ENTRY_CHECK_SECONDS:
                 last_entry_check=now
                 avail=available_balance()
-                for q in eligible_flow_longs(d):
+                for q in eligible_flow_shorts(d):
                     s=str(q.get("symbol","")).upper()
                     if not s or s in ps or s not in meta: continue
                     try:
@@ -471,7 +469,7 @@ def manage_roi_short_exits(d,armed,ps=None):
                         if avail < need:
                             logging.info("ENTRY WAIT %s | available margin $%.2f < required buffer $%.2f",s,avail,need)
                             break
-                        newp=open_flow_long(s,caps.get(s,TARGET_LEV))
+                        newp=open_flow_short(s,caps.get(s,TARGET_LEV))
                         avail=max(0.0,avail-(NOTIONAL/lev))
                         ps[s]=newp; ps_cache[s]=newp
                     except Exception as ex:
