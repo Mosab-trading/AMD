@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V4.1-FLOW-LONG-ONLY-GREEN-SHORT-EXIT-RED16S"
+BOT_VERSION="V4.2-FLOW-ADAPTIVE-GREEN16-LONG-RED16-SHORT"
 TF="15m"; NOTIONAL=float(os.getenv("POSITION_NOTIONAL_USDT","100")); TARGET_LEV=int(os.getenv("TARGET_LEVERAGE","20"))
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -240,6 +240,16 @@ def close_all_shorts_on_green(ps=None):
     return closed
 
 
+def close_all_longs_on_red(ps=None):
+    if ps is None: ps=positions()
+    closed=[]
+    for s,p in list(ps.items()):
+        if float(p["positionAmt"])>0:
+            if close_position_reduce_only(s,p,"FLOW RADAR RED -> close LONG"):
+                closed.append(s)
+    if closed: msg("🔴 RED LONG EXIT | "+", ".join(closed),bal=False)
+    return closed
+
 def roi(p):
     amt=abs(float(p["positionAmt"])); ep=float(p["entryPrice"]); lev=float(p.get("leverage",20)); pnl=float(p["unRealizedProfit"])
     margin=amt*ep/max(lev,1); return 100*pnl/margin if margin else 0.0
@@ -403,28 +413,17 @@ def manage_roi_short_exits(d,armed,ps=None):
         r=roi(p)
         if r>=ROI_ARM_THRESHOLD and s not in armed:
             armed.add(s)
-            logging.info("ROI EXIT ARMED | %s reached %.2f%% >= %.2f%%",s,r,ROI_ARM_THRESHOLD)
-    shorts=short_watch_symbols(d)
-    for s in list(armed & shorts):
-        p=ps.get(s)
-        if p and float(p["positionAmt"])>0:
-            r=roi(p)
-            if close_position_reduce_only(s,p,f"previously reached +{ROI_ARM_THRESHOLD:.0f}% ROI, now EARLY_SHORT_WATCH | current ROI={r:.2f}%"):
-                armed.discard(s)
-    return armed
-
-def main():
+            logging.info("ROI EXIT ARMED | %s reached %.2f%% >= %.2f%%",s,r,ROI_ARM_THRESdef main():
     if not KEY or not SECRET: raise RuntimeError("Missing Binance LIVE API keys")
     exchange_info(); caps=leverage_caps()
     state=load_monitor_state()
-    msg(f"LIVE FLOW SHORT BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | SHORT only | NO MAX POSITIONS\nFlow SHORT scanner entries | GREEN {int(GREEN_CONFIRM_SECONDS)}s -> CLOSE SHORTS | RED {int(RED_CONFIRM_SECONDS)}s protection unchanged",bal=False)
-    red_latched=False; last_monitor=0; last_entry_check=0; red_block_until=0; red_since=0; roi10_armed=set(); green_latched=False; green_since=0
+    msg(f"LIVE FLOW ADAPTIVE BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | ADAPTIVE LONG/SHORT | NO MAX POSITIONS\nGREEN {int(GREEN_CONFIRM_SECONDS)}s -> close SHORTS + LONG mode | RED {int(RED_CONFIRM_SECONDS)}s -> close LONGS + SHORT mode",bal=False)
+    last_monitor=0; last_entry_check=0; roi10_armed=set()
+    green_since=0; red_since=0; confirmed_mode=""
     ps_cache={}; ps_cache_ts=0.0; POSITION_CACHE_SECONDS=15.0
     while True:
         try:
             now=time.time()
-            # Position snapshot is relatively expensive on Binance. Reuse it for 15s
-            # while Flow/RED is still checked every 5s.
             if (not ps_cache_ts) or (now-ps_cache_ts>=POSITION_CACHE_SECONDS):
                 ps_cache=positions()
                 ps_cache_ts=now
@@ -433,72 +432,70 @@ def main():
                 state=monitor_snapshot(state,ps); last_monitor=now
             d=flow_radar_state()
             regime=str(d.get("regime","")).upper() if d else ""
-            if d and regime!="RED":
+            if d:
                 roi10_armed=manage_roi_short_exits(d,roi10_armed,ps)
-            # GREEN must persist continuously before removing SHORT exposure.
+
+            # Regime switches only after a continuous 16s confirmation.
             if d and regime=="GREEN":
+                red_since=0
                 if not green_since:
                     green_since=now
                     logging.warning("GREEN CANDIDATE started | waiting %.0fs confirmation",GREEN_CONFIRM_SECONDS)
-                green_held=now-green_since
-                if green_held < GREEN_CONFIRM_SECONDS:
-                    logging.info("GREEN CONFIRMING | %.0f/%.0fs | SHORT positions remain open",green_held,GREEN_CONFIRM_SECONDS)
-                elif not green_latched:
-                    closed_shorts=close_all_shorts_on_green(ps)
-                    if closed_shorts:
-                        for s in closed_shorts:
-                            ps.pop(s,None); ps_cache.pop(s,None)
-                        ps_cache_ts=time.time()
-                    green_latched=True
-                    logging.info("GREEN CONFIRMED %.0fs | SHORT close completed",green_held)
-            else:
-                if green_since:
-                    logging.info("GREEN CANDIDATE cleared after %.0fs | no SHORT close unless confirmation completed",now-green_since)
+                held=now-green_since
+                if held < GREEN_CONFIRM_SECONDS:
+                    logging.info("GREEN CONFIRMING | %.0f/%.0fs | mode unchanged",held,GREEN_CONFIRM_SECONDS)
+                elif confirmed_mode!="LONG":
+                    closed=close_all_shorts_on_green(ps)
+                    for s in closed:
+                        ps.pop(s,None); ps_cache.pop(s,None)
+                    ps_cache_ts=time.time()
+                    confirmed_mode="LONG"
+                    msg(f"🟢 GREEN CONFIRMED {int(GREEN_CONFIRM_SECONDS)}s -> LONG MODE",bal=False)
+            elif d and regime=="RED":
                 green_since=0
-                green_latched=False
-            if d and regime=="RED":
                 if not red_since:
                     red_since=now
                     logging.warning("RED CANDIDATE started | waiting %.0fs confirmation",RED_CONFIRM_SECONDS)
                 held=now-red_since
                 if held < RED_CONFIRM_SECONDS:
-                    logging.info("RED CONFIRMING | %.0f/%.0fs | positions remain open",held,RED_CONFIRM_SECONDS)
-                else:
-                    # Only a continuously confirmed RED may close positions and start the 15m re-entry block.
-                    candle_end=(int(now)//900+1)*900
-                    if candle_end>red_block_until:
-                        red_block_until=candle_end
-                        logging.info("RED CONFIRMED %.0fs | 15M ENTRY BLOCK until %s",held,time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(red_block_until)))
-                    if (not red_latched) or ps:
-                        if close_all_account_positions(f"FLOW RADAR RED CONFIRMED {int(RED_CONFIRM_SECONDS)}s",ps):
-                            ps_cache={}; ps_cache_ts=time.time()
-                            red_latched=True
-                            state=load_monitor_state(); state["peak_portfolio_pnl"]=0.0; save_monitor_state(state)
-            elif d:
+                    logging.info("RED CONFIRMING | %.0f/%.0fs | mode unchanged",held,RED_CONFIRM_SECONDS)
+                elif confirmed_mode!="SHORT":
+                    closed=close_all_longs_on_red(ps)
+                    for s in closed:
+                        ps.pop(s,None); ps_cache.pop(s,None)
+                    ps_cache_ts=time.time()
+                    confirmed_mode="SHORT"
+                    msg(f"🔴 RED CONFIRMED {int(RED_CONFIRM_SECONDS)}s -> SHORT MODE",bal=False)
+            else:
+                if green_since:
+                    logging.info("GREEN CANDIDATE cleared after %.0fs | mode unchanged",now-green_since)
                 if red_since:
-                    logging.info("RED CANDIDATE cleared after %.0fs | no close unless confirmation completed",now-red_since)
-                    red_since=0
-                if red_latched:
-                    red_latched=False
-                    msg(f"FLOW RADAR RED CLEARED -> {regime} | WAITING FOR CURRENT 15M CANDLE TO CLOSE",bal=False)
-                if now < red_block_until:
-                    logging.info("ENTRY BLOCKED after RED | %.0fs until next 15m candle",red_block_until-now)
-                elif now-last_entry_check>=ENTRY_CHECK_SECONDS:
-                    last_entry_check=now
-                    avail=available_balance()
-                    # SHORT-only mode: do not add new exposure while GREEN is being confirmed.
-                    if regime!="GREEN":
-                        for q in eligible_flow_shorts(d):
-                            s=str(q.get("symbol","")).upper()
-                            if not s or s in ps or s not in meta: continue
-                            try:
-                                lev=max(1,min(TARGET_LEV,int(caps.get(s,TARGET_LEV) or TARGET_LEV)))
-                                need=(NOTIONAL/lev)*1.10
-                                if avail < need:
-                                    logging.info("ENTRY WAIT %s | available margin $%.2f < required buffer $%.2f",s,avail,need)
-                                    break
-                                newp=open_flow_short(s,caps.get(s,TARGET_LEV))
-                                avail=max(0.0,avail-(NOTIONAL/lev))
+                    logging.info("RED CANDIDATE cleared after %.0fs | mode unchanged",now-red_since)
+                green_since=0; red_since=0
+
+            if d and confirmed_mode and now-last_entry_check>=ENTRY_CHECK_SECONDS:
+                last_entry_check=now
+                avail=available_balance()
+                candidates=eligible_flow_longs(d) if confirmed_mode=="LONG" else eligible_flow_shorts(d)
+                for q in candidates:
+                    s=str(q.get("symbol","")).upper()
+                    if not s or s in ps or s not in meta: continue
+                    try:
+                        lev=max(1,min(TARGET_LEV,int(caps.get(s,TARGET_LEV) or TARGET_LEV)))
+                        need=(NOTIONAL/lev)*1.10
+                        if avail < need:
+                            logging.info("ENTRY WAIT %s | available margin $%.2f < required buffer $%.2f",s,avail,need)
+                            break
+                        newp=open_flow_long(s,caps.get(s,TARGET_LEV)) if confirmed_mode=="LONG" else open_flow_short(s,caps.get(s,TARGET_LEV))
+                        avail=max(0.0,avail-(NOTIONAL/lev))
+                        ps[s]=newp; ps_cache[s]=newp
+                    except Exception as ex:
+                        logging.warning("ENTRY SKIP %s: %s",s,ex)
+
+            time.sleep(5)
+        except Exception as ex:
+            logging.exception(ex); time.sleep(5)
+=max(0.0,avail-(NOTIONAL/lev))
                                 ps[s]=newp
                                 ps_cache[s]=newp
                             except Exception as ex:
