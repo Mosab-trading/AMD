@@ -420,7 +420,7 @@ def main():
     if not KEY or not SECRET: raise RuntimeError("Missing Binance LIVE API keys")
     exchange_info(); caps=leverage_caps()
     state=load_monitor_state()
-    msg(f"LIVE FLOW SHORT BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | SHORT ONLY | NO MAX POSITIONS\nALL LONGS CLOSED ON START | EARLY_SHORT_WATCH entries | GREEN {int(GREEN_CONFIRM_SECONDS)}s -> CLOSE/BLOCK SHORTS | +500% ROI -> FULL EXIT",bal=False)
+    msg(f"LIVE FLOW SHORT BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | SHORT ONLY | NO MAX POSITIONS\nALL LONGS CLOSED ON START | EARLY_SHORT_WATCH entries | GREEN {int(GREEN_CONFIRM_SECONDS)}s -> CLOSE/BLOCK SHORTS",bal=False)
 
     # User requested SHORT-only now: close any existing LONG exposure immediately.
     startup_ps=positions()
@@ -443,18 +443,6 @@ def main():
                 state=monitor_snapshot(state,ps); last_monitor=now
             d=flow_radar_state()
             regime=str(d.get("regime","")).upper() if d else ""
-
-            tp500=[]
-            for s,p in list(ps.items()):
-                try:
-                    r=roi(p)
-                    if r>=500.0 and close_position_reduce_only(s,p,f"ROI TAKE PROFIT {r:.2f}% >= 500%"):
-                        tp500.append(s); ps.pop(s,None); ps_cache.pop(s,None)
-                except Exception as ex:
-                    logging.warning("ROI 500 EXIT SKIP %s: %s",s,ex)
-            if tp500:
-                ps_cache_ts=time.time()
-                msg("🏁 ROI +500% TAKE PROFIT | "+", ".join(tp500),bal=False)
 
             if d and regime=="GREEN":
                 if not green_since: green_since=now
