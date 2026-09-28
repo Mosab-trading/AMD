@@ -246,7 +246,7 @@ def enter(s,d,setup=None,btc=None):
     algo_close(s,d,"TAKE_PROFIT_MARKET",tp,close_position=True)
     # V2.1: keep ONE exchange-side protective STOP only. Profit targets are managed
     # by manage() from live leveraged ROI. This prevents -4045 max algo/stop-order saturation.
-        details = (setup or {}).get("details","")
+    details = (setup or {}).get("details","")
     entry_rsi = None
     entry_vol = None
     entry_buy = None
@@ -387,7 +387,7 @@ def record_closed_trade(s, st):
         elif stage>=1: reason="PROTECTED_-25_STOP_OR_EXTERNAL"
         elif net<0: reason="INITIAL_SL_OR_EXTERNAL"
         d=_report_load()
-                d["closed"].append({
+        d["closed"].append({
             "symbol":s,
             "side":st.get("dir",""),
             "net":net,
@@ -856,14 +856,14 @@ def scan():
             # V2.1: market direction controls NEW slots only. Existing positions are never
             # force-closed on a BTC context flip; they keep their own SL/TP management.
             if ctx["bias"] in ("SHORT","NEUTRAL"):
-    sh_reversal = short_engine(s, ctx)
-    sh_trend = short_trend_breakdown_engine(s, ctx)
+                sh_reversal = short_engine(s, ctx)
+                sh_trend = short_trend_breakdown_engine(s, ctx)
 
-    shorts = [x for x in (sh_reversal, sh_trend) if x]
+                shorts = [x for x in (sh_reversal, sh_trend) if x]
 
-    if shorts:
-        sh = max(shorts, key=lambda x: float(x["score"]))
-        candidates.append((float(sh["score"]), s, sh))
+                if shorts:
+                    sh = max(shorts, key=lambda x: float(x["score"]))
+                    candidates.append((float(sh["score"]), s, sh))
             if ctx["bias"] in ("LONG","NEUTRAL"):
                 lo=long_engine(s,ctx)
                 if lo:candidates.append((float(lo["score"]),s,lo))
