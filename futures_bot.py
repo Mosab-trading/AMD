@@ -416,6 +416,8 @@ def manage_roi_short_exits(d,armed,ps=None):
             logging.info("ROI EXIT ARMED | %s reached %.2f%% >= %.2f%%",s,r,ROI_ARM_THRESHOLD)
 
 
+def main():
+
     if not KEY or not SECRET: raise RuntimeError("Missing Binance LIVE API keys")
     exchange_info(); caps=leverage_caps()
     state=load_monitor_state()
