@@ -382,16 +382,20 @@ def monitor_snapshot(state,ps=None):
     return state
 
 def close_position_reduce_only(s,p,reason):
+    # MARKET RESULT already confirms execution; avoid a second heavy positionRisk
+    # request per symbol. The main cached bulk snapshot verifies account state later.
     try:
         amt=float(p["positionAmt"])
         if not amt: return True
         cancel_algo(s)
         side="SELL" if amt>0 else "BUY"
-        market(s,side,abs(amt),True)
-        time.sleep(.35)
-        if not pos(s):
+        o=market(s,side,abs(amt),True)
+        status=str(o.get("status","")).upper()
+        executed=float(o.get("executedQty",0) or 0)
+        if status=="FILLED" or executed>0:
             msg(f"🟠 FLOW EXIT | {s} | {reason}",bal=False)
             return True
+        logging.warning("FLOW EXIT unconfirmed %s | status=%s executed=%s",s,status,executed)
     except Exception as e:
         logging.error("FLOW EXIT failed %s: %s",s,e)
     return False
@@ -426,7 +430,7 @@ def main():
     last_monitor=0; last_entry_check=0
     red_since=0; red_latched=False
     breakeven_armed=False; trading_paused=False
-    ps_cache={}; ps_cache_ts=0.0; POSITION_CACHE_SECONDS=float(os.getenv("POSITION_CACHE_SECONDS","45"))
+    ps_cache={}; ps_cache_ts=0.0; POSITION_CACHE_SECONDS=float(os.getenv("POSITION_CACHE_SECONDS","60"))
     while True:
         try:
             now=time.time()
