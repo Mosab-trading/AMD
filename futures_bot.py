@@ -417,68 +417,69 @@ def manage_roi_short_exits(d,armed,ps=None):
 
 
 def main():
-
     if not KEY or not SECRET: raise RuntimeError("Missing Binance LIVE API keys")
     exchange_info(); caps=leverage_caps()
     state=load_monitor_state()
-    msg(f"LIVE FLOW SHORT BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | SHORT ONLY | NO MAX POSITIONS\nEARLY_SHORT_WATCH entries | GREEN {int(GREEN_CONFIRM_SECONDS)}s -> CLOSE SHORTS + BLOCK NEW SHORTS UNTIL GREEN CLEARS",bal=False)
+    msg(f"LIVE FLOW MIX BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | MIX LONG + SHORT | NO MAX POSITIONS\nEARLY_LONG_WATCH + EARLY_SHORT_WATCH entries | RED closes/blocks LONG | GREEN closes/blocks SHORT after {int(GREEN_CONFIRM_SECONDS)}s confirmation",bal=False)
     last_monitor=0; last_entry_check=0
-    green_since=0; green_latched=False
+    green_since=0; red_since=0; green_latched=False; red_latched=False
     ps_cache={}; ps_cache_ts=0.0; POSITION_CACHE_SECONDS=15.0
     while True:
         try:
             now=time.time()
             if (not ps_cache_ts) or (now-ps_cache_ts>=POSITION_CACHE_SECONDS):
-                ps_cache=positions()
-                ps_cache_ts=now
+                ps_cache=positions(); ps_cache_ts=now
             ps=dict(ps_cache)
             if now-last_monitor>=MONITOR_INTERVAL:
                 state=monitor_snapshot(state,ps); last_monitor=now
             d=flow_radar_state()
             regime=str(d.get("regime","")).upper() if d else ""
 
-            # GREEN must persist continuously for 16s before SHORT exposure is closed.
             if d and regime=="GREEN":
-                if not green_since:
-                    green_since=now
-                    logging.warning("GREEN CANDIDATE started | waiting %.0fs confirmation",GREEN_CONFIRM_SECONDS)
-                held=now-green_since
-                if held < GREEN_CONFIRM_SECONDS:
-                    logging.info("GREEN CONFIRMING | %.0f/%.0fs | SHORT positions remain open",held,GREEN_CONFIRM_SECONDS)
-                elif not green_latched:
+                if not green_since: green_since=now
+                if now-green_since>=GREEN_CONFIRM_SECONDS and not green_latched:
                     closed=close_all_shorts_on_green(ps)
-                    for s in closed:
-                        ps.pop(s,None); ps_cache.pop(s,None)
-                    ps_cache_ts=time.time()
-                    green_latched=True
-                    msg(f"🟢 GREEN CONFIRMED {int(GREEN_CONFIRM_SECONDS)}s -> SHORTS CLOSED | NEW SHORTS BLOCKED",bal=False)
+                    for s in closed: ps.pop(s,None); ps_cache.pop(s,None)
+                    ps_cache_ts=time.time(); green_latched=True
+                    msg(f"🟢 GREEN CONFIRMED {int(GREEN_CONFIRM_SECONDS)}s -> SHORTS CLOSED/BLOCKED",bal=False)
             else:
-                if green_since:
-                    logging.info("GREEN CANDIDATE cleared after %.0fs",now-green_since)
                 green_since=0
-                if green_latched:
-                    green_latched=False
-                    msg(f"GREEN CLEARED -> {regime or 'NEUTRAL'} | SHORT ENTRIES ENABLED",bal=False)
+                if green_latched: green_latched=False
 
-            # SHORT ONLY: never route a LONG order.
-            if d and regime!="GREEN" and not green_latched and now-last_entry_check>=ENTRY_CHECK_SECONDS:
+            if d and regime=="RED":
+                if not red_since: red_since=now
+                if now-red_since>=GREEN_CONFIRM_SECONDS and not red_latched:
+                    closed=close_all_longs_on_red(ps)
+                    for s in closed: ps.pop(s,None); ps_cache.pop(s,None)
+                    ps_cache_ts=time.time(); red_latched=True
+                    msg(f"🔴 RED CONFIRMED {int(GREEN_CONFIRM_SECONDS)}s -> LONGS CLOSED/BLOCKED",bal=False)
+            else:
+                red_since=0
+                if red_latched: red_latched=False
+
+            if d and now-last_entry_check>=ENTRY_CHECK_SECONDS:
                 last_entry_check=now
                 avail=available_balance()
-                for q in eligible_flow_shorts(d):
+                candidates=[]
+                if regime!="RED" and not red_latched:
+                    candidates += [(q,"LONG") for q in eligible_flow_longs(d)]
+                if regime!="GREEN" and not green_latched:
+                    candidates += [(q,"SHORT") for q in eligible_flow_shorts(d)]
+                candidates.sort(key=lambda z:float(z[0].get("score",0) or 0),reverse=True)
+                for q,side in candidates:
                     s=str(q.get("symbol","")).upper()
                     if not s or s in ps or s not in meta: continue
                     try:
                         lev=max(1,min(TARGET_LEV,int(caps.get(s,TARGET_LEV) or TARGET_LEV)))
                         need=(NOTIONAL/lev)*1.10
                         if avail < need:
-                            logging.info("ENTRY WAIT %s | available margin $%.2f < required buffer $%.2f",s,avail,need)
+                            logging.info("ENTRY WAIT %s %s | available margin $%.2f < required buffer $%.2f",s,side,avail,need)
                             break
-                        newp=open_flow_short(s,caps.get(s,TARGET_LEV))
+                        newp=open_flow_long(s,caps.get(s,TARGET_LEV)) if side=="LONG" else open_flow_short(s,caps.get(s,TARGET_LEV))
                         avail=max(0.0,avail-(NOTIONAL/lev))
                         ps[s]=newp; ps_cache[s]=newp
                     except Exception as ex:
-                        logging.warning("ENTRY SKIP %s: %s",s,ex)
-
+                        logging.warning("ENTRY SKIP %s %s: %s",s,side,ex)
             time.sleep(5)
         except Exception as ex:
             logging.exception(ex); time.sleep(5)
