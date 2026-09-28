@@ -432,6 +432,7 @@ def main():
 
     last_monitor=0; last_entry_check=0
     green_since=0; green_latched=False
+    breakeven_armed=False; trading_paused=False
     ps_cache={}; ps_cache_ts=0.0; POSITION_CACHE_SECONDS=15.0
     while True:
         try:
@@ -441,10 +442,20 @@ def main():
             ps=dict(ps_cache)
             if now-last_monitor>=MONITOR_INTERVAL:
                 state=monitor_snapshot(state,ps); last_monitor=now
+            total_upnl=sum(float(p.get("unRealizedProfit",0) or 0) for p in ps.values())
+            if not trading_paused:
+                if total_upnl>0:
+                    breakeven_armed=True
+                elif breakeven_armed and total_upnl<=0:
+                    ok=close_all_account_positions("BREAK-EVEN PROTECTION",ps)
+                    if ok:
+                        trading_paused=True
+                        ps.clear(); ps_cache.clear(); ps_cache_ts=time.time()
+                        msg("⏸ BREAK-EVEN PAUSE | Account returned to break-even from profit | ALL POSITIONS CLOSED | NEW ENTRIES DISABLED until manual re-enable",bal=False)
             d=flow_radar_state()
             regime=str(d.get("regime","")).upper() if d else ""
 
-            if d and regime=="GREEN":
+            if not trading_paused and d and regime=="GREEN":
                 if not green_since: green_since=now
                 held=now-green_since
                 if held>=GREEN_CONFIRM_SECONDS and not green_latched:
@@ -466,7 +477,7 @@ def main():
                     green_latched=False
                     msg(f"GREEN CLEARED -> {regime or 'NEUTRAL'} | SHORT ENTRIES ENABLED",bal=False)
 
-            if d and regime!="GREEN" and not green_latched and now-last_entry_check>=ENTRY_CHECK_SECONDS:
+            if not trading_paused and d and regime!="GREEN" and not green_latched and now-last_entry_check>=ENTRY_CHECK_SECONDS:
                 last_entry_check=now
                 avail=available_balance()
                 for q in eligible_flow_shorts(d):
