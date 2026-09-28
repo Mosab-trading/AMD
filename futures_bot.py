@@ -443,15 +443,6 @@ def main():
             if now-last_monitor>=MONITOR_INTERVAL:
                 state=monitor_snapshot(state,ps); last_monitor=now
             total_upnl=sum(float(p.get("unRealizedProfit",0) or 0) for p in ps.values())
-            if not trading_paused:
-                if total_upnl>0:
-                    breakeven_armed=True
-                elif breakeven_armed and total_upnl<=0:
-                    ok=close_all_account_positions("BREAK-EVEN PROTECTION",ps)
-                    if ok:
-                        trading_paused=True
-                        ps.clear(); ps_cache.clear(); ps_cache_ts=time.time()
-                        msg("⏸ BREAK-EVEN PAUSE | Account returned to break-even from profit | ALL POSITIONS CLOSED | NEW ENTRIES DISABLED until manual re-enable",bal=False)
             d=flow_radar_state()
             regime=str(d.get("regime","")).upper() if d else ""
 
