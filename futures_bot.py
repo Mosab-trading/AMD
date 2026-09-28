@@ -688,7 +688,121 @@ def long_engine(s,btc):
     if not (score>=70 and (choch or retest or reclaim) and (trend or c[-1]>vwap)):return None
     return {"side":"LONG","score":round(score,2),"tag":"LONG_TREND+VWAP+CHOCH+FLOW",
             "details":f"rsi={r:.1f} vol={vr:.2f} buy={buy:.2f}"}
+def short_trend_breakdown_engine(s, btc):
+    """
+    Trend Breakdown SHORT:
+    يمسك الهبوط المستمر حتى بدون Liquidity Trap / PO3.
+    """
 
+    k = klines(s)
+    if not k or len(k) < 100:
+        return None
+
+    o = np.array([float(x[1]) for x in k])
+    h = np.array([float(x[2]) for x in k])
+    l = np.array([float(x[3]) for x in k])
+    c = np.array([float(x[4]) for x in k])
+    v = np.array([float(x[5]) for x in k])
+    tb = np.array([float(x[9]) for x in k])
+
+    e21 = float(pd.Series(c).ewm(span=21, adjust=False).mean().iloc[-1])
+    e55 = float(pd.Series(c).ewm(span=55, adjust=False).mean().iloc[-1])
+
+    tp = (h + l + c) / 3
+    vwap = float(
+        np.sum(tp[-20:] * v[-20:]) /
+        max(np.sum(v[-20:]), 1e-12)
+    )
+
+    r = rsi_last(c)
+    vr = float(v[-1] / max(np.mean(v[-20:]), 1e-12))
+    buy = float(np.sum(tb[-3:]) / max(np.sum(v[-3:]), 1e-12))
+
+    # اتجاه هابط
+    trend = e21 < e55 and c[-1] < e21
+    below_vwap = c[-1] < vwap
+
+    # كسر Structure
+    prior_low = float(np.min(l[-12:-2]))
+    breakdown = c[-1] < prior_low
+
+    # كسر سابق ثم Retest فاشل
+    recent_break = np.min(c[-4:-1]) < prior_low
+
+    failed_retest = (
+        recent_break
+        and h[-1] >= min(e21, vwap) * 0.997
+        and c[-1] < min(e21, vwap)
+        and c[-1] < o[-1]
+    )
+
+    # ضغط البيع
+    seller_control = buy <= 0.48
+    strong_selling = buy <= 0.44
+    volume_confirm = vr >= 1.05 and c[-1] < o[-1]
+
+    # منع مطاردة الهبوط بعد التشبع البيعي
+    if r < 28:
+        return None
+
+    move_3 = (c[-1] / c[-4] - 1) * 100
+
+    if move_3 < -4.0:
+        return None
+
+    score = 0.0
+
+    if trend:
+        score += 24
+
+    if below_vwap:
+        score += 14
+
+    if breakdown:
+        score += 18
+
+    if failed_retest:
+        score += 18
+
+    if seller_control:
+        score += 10
+
+    if strong_selling:
+        score += 5
+
+    if volume_confirm:
+        score += 10
+
+    if 32 <= r <= 55:
+        score += 8
+
+    # BTC Bonus فقط
+    score += float(btc.get("short_bonus", 0))
+
+    if not (breakdown or failed_retest):
+        return None
+
+    if not (trend and below_vwap):
+        return None
+
+    if not (seller_control or volume_confirm):
+        return None
+
+    if score < 72:
+        return None
+
+    return {
+        "side": "SHORT",
+        "score": round(score, 2),
+        "tag": "SHORT_TREND_BREAKDOWN",
+        "details": (
+            f"rsi={r:.1f} "
+            f"vol={vr:.2f} "
+            f"buy={buy:.2f} "
+            f"break={int(breakdown)} "
+            f"retest={int(failed_retest)}"
+        )
+    }
 def short_engine(s,btc):
     """Preserve original Liquidity Reversal SHORT trigger; add quality ranking."""
     ls=liquidity_entry_signal(s)
@@ -742,8 +856,14 @@ def scan():
             # V2.1: market direction controls NEW slots only. Existing positions are never
             # force-closed on a BTC context flip; they keep their own SL/TP management.
             if ctx["bias"] in ("SHORT","NEUTRAL"):
-                sh=short_engine(s,ctx)
-                if sh:candidates.append((float(sh["score"]),s,sh))
+    sh_reversal = short_engine(s, ctx)
+    sh_trend = short_trend_breakdown_engine(s, ctx)
+
+    shorts = [x for x in (sh_reversal, sh_trend) if x]
+
+    if shorts:
+        sh = max(shorts, key=lambda x: float(x["score"]))
+        candidates.append((float(sh["score"]), s, sh))
             if ctx["bias"] in ("LONG","NEUTRAL"):
                 lo=long_engine(s,ctx)
                 if lo:candidates.append((float(lo["score"]),s,lo))
