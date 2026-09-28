@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V4.2-FLOW-ADAPTIVE-GREEN16-LONG-RED16-SHORT"
+BOT_VERSION="V4.3-FLOW-LONG-ONLY-RED16-PROTECTION"
 TF="15m"; NOTIONAL=float(os.getenv("POSITION_NOTIONAL_USDT","100")); TARGET_LEV=int(os.getenv("TARGET_LEVERAGE","20"))
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -417,9 +417,9 @@ def manage_roi_short_exits(d,armed,ps=None):
     if not KEY or not SECRET: raise RuntimeError("Missing Binance LIVE API keys")
     exchange_info(); caps=leverage_caps()
     state=load_monitor_state()
-    msg(f"LIVE FLOW ADAPTIVE BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | ADAPTIVE LONG/SHORT | NO MAX POSITIONS\nGREEN {int(GREEN_CONFIRM_SECONDS)}s -> close SHORTS + LONG mode | RED {int(RED_CONFIRM_SECONDS)}s -> close LONGS + SHORT mode",bal=False)
+    msg(f"LIVE FLOW LONG BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | LONG ONLY | NO MAX POSITIONS\nEARLY_LONG_WATCH entries | RED {int(RED_CONFIRM_SECONDS)}s -> CLOSE LONGS + BLOCK NEW LONGS UNTIL RED CLEARS",bal=False)
     last_monitor=0; last_entry_check=0; roi10_armed=set()
-    green_since=0; red_since=0; confirmed_mode=""
+    red_since=0; red_latched=False
     ps_cache={}; ps_cache_ts=0.0; POSITION_CACHE_SECONDS=15.0
     while True:
         try:
@@ -432,52 +432,37 @@ def manage_roi_short_exits(d,armed,ps=None):
                 state=monitor_snapshot(state,ps); last_monitor=now
             d=flow_radar_state()
             regime=str(d.get("regime","")).upper() if d else ""
-            if d:
+            if d and regime!="RED":
                 roi10_armed=manage_roi_short_exits(d,roi10_armed,ps)
 
-            # Regime switches only after a continuous 16s confirmation.
-            if d and regime=="GREEN":
-                red_since=0
-                if not green_since:
-                    green_since=now
-                    logging.warning("GREEN CANDIDATE started | waiting %.0fs confirmation",GREEN_CONFIRM_SECONDS)
-                held=now-green_since
-                if held < GREEN_CONFIRM_SECONDS:
-                    logging.info("GREEN CONFIRMING | %.0f/%.0fs | mode unchanged",held,GREEN_CONFIRM_SECONDS)
-                elif confirmed_mode!="LONG":
-                    closed=close_all_shorts_on_green(ps)
-                    for s in closed:
-                        ps.pop(s,None); ps_cache.pop(s,None)
-                    ps_cache_ts=time.time()
-                    confirmed_mode="LONG"
-                    msg(f"🟢 GREEN CONFIRMED {int(GREEN_CONFIRM_SECONDS)}s -> LONG MODE",bal=False)
-            elif d and regime=="RED":
-                green_since=0
+            # RED must persist continuously for 16s before LONG exposure is closed.
+            if d and regime=="RED":
                 if not red_since:
                     red_since=now
                     logging.warning("RED CANDIDATE started | waiting %.0fs confirmation",RED_CONFIRM_SECONDS)
                 held=now-red_since
                 if held < RED_CONFIRM_SECONDS:
-                    logging.info("RED CONFIRMING | %.0f/%.0fs | mode unchanged",held,RED_CONFIRM_SECONDS)
-                elif confirmed_mode!="SHORT":
+                    logging.info("RED CONFIRMING | %.0f/%.0fs | LONG positions remain open",held,RED_CONFIRM_SECONDS)
+                elif not red_latched:
                     closed=close_all_longs_on_red(ps)
                     for s in closed:
                         ps.pop(s,None); ps_cache.pop(s,None)
                     ps_cache_ts=time.time()
-                    confirmed_mode="SHORT"
-                    msg(f"🔴 RED CONFIRMED {int(RED_CONFIRM_SECONDS)}s -> SHORT MODE",bal=False)
+                    red_latched=True
+                    msg(f"🔴 RED CONFIRMED {int(RED_CONFIRM_SECONDS)}s -> LONGS CLOSED | NEW LONGS BLOCKED",bal=False)
             else:
-                if green_since:
-                    logging.info("GREEN CANDIDATE cleared after %.0fs | mode unchanged",now-green_since)
                 if red_since:
-                    logging.info("RED CANDIDATE cleared after %.0fs | mode unchanged",now-red_since)
-                green_since=0; red_since=0
+                    logging.info("RED CANDIDATE cleared after %.0fs",now-red_since)
+                red_since=0
+                if red_latched:
+                    red_latched=False
+                    msg(f"RED CLEARED -> {regime or 'NEUTRAL'} | LONG ENTRIES ENABLED",bal=False)
 
-            if d and confirmed_mode and now-last_entry_check>=ENTRY_CHECK_SECONDS:
+            # LONG ONLY: never route a SHORT order.
+            if d and regime!="RED" and not red_latched and now-last_entry_check>=ENTRY_CHECK_SECONDS:
                 last_entry_check=now
                 avail=available_balance()
-                candidates=eligible_flow_longs(d) if confirmed_mode=="LONG" else eligible_flow_shorts(d)
-                for q in candidates:
+                for q in eligible_flow_longs(d):
                     s=str(q.get("symbol","")).upper()
                     if not s or s in ps or s not in meta: continue
                     try:
@@ -486,20 +471,11 @@ def manage_roi_short_exits(d,armed,ps=None):
                         if avail < need:
                             logging.info("ENTRY WAIT %s | available margin $%.2f < required buffer $%.2f",s,avail,need)
                             break
-                        newp=open_flow_long(s,caps.get(s,TARGET_LEV)) if confirmed_mode=="LONG" else open_flow_short(s,caps.get(s,TARGET_LEV))
+                        newp=open_flow_long(s,caps.get(s,TARGET_LEV))
                         avail=max(0.0,avail-(NOTIONAL/lev))
                         ps[s]=newp; ps_cache[s]=newp
                     except Exception as ex:
                         logging.warning("ENTRY SKIP %s: %s",s,ex)
-
-            time.sleep(5)
-        except Exception as ex:
-            logging.exception(ex); time.sleep(5)
-=max(0.0,avail-(NOTIONAL/lev))
-                                ps[s]=newp
-                                ps_cache[s]=newp
-                            except Exception as ex:
-                                logging.warning("ENTRY SKIP %s: %s",s,ex)
 
             time.sleep(5)
         except Exception as ex:
