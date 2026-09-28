@@ -435,6 +435,20 @@ def main():
             d=flow_radar_state()
             regime=str(d.get("regime","")).upper() if d else ""
 
+            # Hard take-profit: close the full position immediately at +500% ROI.
+            tp500=[]
+            for s,p in list(ps.items()):
+                try:
+                    r=roi(p)
+                    if r>=500.0 and close_position_reduce_only(s,p,f"ROI TAKE PROFIT {r:.2f}% >= 500%"):
+                        tp500.append(s)
+                        ps.pop(s,None); ps_cache.pop(s,None)
+                except Exception as ex:
+                    logging.warning("ROI 500 EXIT SKIP %s: %s",s,ex)
+            if tp500:
+                ps_cache_ts=time.time()
+                msg("🏁 ROI +500% TAKE PROFIT | "+", ".join(tp500),bal=False)
+
             if d and regime=="GREEN":
                 if not green_since: green_since=now
                 if now-green_since>=GREEN_CONFIRM_SECONDS and not green_latched:
