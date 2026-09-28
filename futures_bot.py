@@ -420,18 +420,11 @@ def main():
     if not KEY or not SECRET: raise RuntimeError("Missing Binance LIVE API keys")
     exchange_info(); caps=leverage_caps()
     state=load_monitor_state()
-    msg(f"LIVE FLOW SHORT BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | SHORT ONLY | NO MAX POSITIONS\nALL LONGS CLOSED ON START | EARLY_SHORT_WATCH entries | GREEN {int(GREEN_CONFIRM_SECONDS)}s -> CLOSE/BLOCK SHORTS",bal=False)
+    msg(f"LIVE FLOW LONG BOT {BOT_VERSION} STARTED\nUSD 100 post-leverage notional per position | LONG ONLY | NO MAX POSITIONS\nNO NEW SHORTS | EARLY_LONG_WATCH entries | RED {int(RED_CONFIRM_SECONDS)}s -> CLOSE/BLOCK LONGS",bal=False)
 
-    # User requested SHORT-only now: close any existing LONG exposure immediately.
-    startup_ps=positions()
-    startup_longs={s:p for s,p in startup_ps.items() if float(p["positionAmt"])>0}
-    if startup_longs:
-        closed=close_all_longs_on_red(startup_longs)
-        logging.warning("SHORT-ONLY STARTUP | requested LONG close | closed=%s",",".join(closed))
-        time.sleep(1)
-
+    # LONG-only mode: no new SHORT entries are routed.
     last_monitor=0; last_entry_check=0
-    green_since=0; green_latched=False
+    red_since=0; red_latched=False
     breakeven_armed=False; trading_paused=False
     ps_cache={}; ps_cache_ts=0.0; POSITION_CACHE_SECONDS=15.0
     while True:
@@ -446,45 +439,37 @@ def main():
             d=flow_radar_state()
             regime=str(d.get("regime","")).upper() if d else ""
 
-            if not trading_paused and d and regime=="GREEN":
-                if not green_since: green_since=now
-                held=now-green_since
-                if held>=GREEN_CONFIRM_SECONDS and not green_latched:
-                    b60=d.get("b60") or {}
-                    flow60_ok=(float(b60.get("net",0) or 0)>=0.40
-                               and float(b60.get("rs",0) or 0)>0
-                               and float(b60.get("positive",0) or 0)>=0.60)
-                    if flow60_ok:
-                        closed=close_all_shorts_on_green(ps)
-                        for s in closed: ps.pop(s,None); ps_cache.pop(s,None)
-                        ps_cache_ts=time.time(); green_latched=True
-                        msg(f"🟢 GREEN CONFIRMED {int(GREEN_CONFIRM_SECONDS)}s + 60s BREADTH CONFIRMED -> SHORTS CLOSED/BLOCKED",bal=False)
-                    else:
-                        logging.info("GREEN %.0fs BUT 60s BREADTH NOT CONFIRMED | net=%s rs=%s positive=%s | SHORTS KEPT OPEN",
-                                     held,b60.get("net"),b60.get("rs"),b60.get("positive"))
+            if not trading_paused and d and regime=="RED":
+                if not red_since: red_since=now
+                held=now-red_since
+                if held>=RED_CONFIRM_SECONDS and not red_latched:
+                    closed=close_all_longs_on_red(ps)
+                    for s in closed: ps.pop(s,None); ps_cache.pop(s,None)
+                    ps_cache_ts=time.time(); red_latched=True
+                    msg(f"🔴 RED CONFIRMED {int(RED_CONFIRM_SECONDS)}s -> LONGS CLOSED/BLOCKED",bal=False)
             else:
-                green_since=0
-                if green_latched:
-                    green_latched=False
-                    msg(f"GREEN CLEARED -> {regime or 'NEUTRAL'} | SHORT ENTRIES ENABLED",bal=False)
+                red_since=0
+                if red_latched:
+                    red_latched=False
+                    msg(f"RED CLEARED -> {regime or 'NEUTRAL'} | LONG ENTRIES ENABLED",bal=False)
 
-            if not trading_paused and d and regime!="GREEN" and not green_latched and now-last_entry_check>=ENTRY_CHECK_SECONDS:
+            if not trading_paused and d and regime!="RED" and not red_latched and now-last_entry_check>=ENTRY_CHECK_SECONDS:
                 last_entry_check=now
                 avail=available_balance()
-                for q in eligible_flow_shorts(d):
+                for q in eligible_flow_longs(d):
                     s=str(q.get("symbol","")).upper()
                     if not s or s in ps or s not in meta: continue
                     try:
                         lev=max(1,min(TARGET_LEV,int(caps.get(s,TARGET_LEV) or TARGET_LEV)))
                         need=(NOTIONAL/lev)*1.10
                         if avail < need:
-                            logging.info("ENTRY WAIT %s SHORT | available margin $%.2f < required buffer $%.2f",s,avail,need)
+                            logging.info("ENTRY WAIT %s LONG | available margin $%.2f < required buffer $%.2f",s,avail,need)
                             break
-                        newp=open_flow_short(s,caps.get(s,TARGET_LEV))
+                        newp=open_flow_long(s,caps.get(s,TARGET_LEV))
                         avail=max(0.0,avail-(NOTIONAL/lev))
                         ps[s]=newp; ps_cache[s]=newp
                     except Exception as ex:
-                        logging.warning("ENTRY SKIP %s SHORT: %s",s,ex)
+                        logging.warning("ENTRY SKIP %s LONG: %s",s,ex)
             time.sleep(5)
         except Exception as ex:
             logging.exception(ex); time.sleep(5)
