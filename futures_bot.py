@@ -153,7 +153,7 @@ FLOW_RADAR_MAX_AGE=float(os.getenv("FLOW_RADAR_MAX_AGE","120"))
 PREMOVE_MAX_AGE=float(os.getenv("PREMOVE_MAX_AGE","45"))
 ENTRY_CHECK_SECONDS=float(os.getenv("ENTRY_CHECK_SECONDS","15"))
 RED_CONFIRM_SECONDS=float(os.getenv("RED_CONFIRM_SECONDS","16"))
-GREEN_CONFIRM_SECONDS=float(os.getenv("GREEN_CONFIRM_SECONDS","16"))
+GREEN_CONFIRM_SECONDS=float(os.getenv("GREEN_CONFIRM_SECONDS","60"))
 ROI_ARM_THRESHOLD=float(os.getenv("ROI_ARM_THRESHOLD","20"))
 
 def flow_radar_state():
@@ -460,10 +460,18 @@ def main():
                 if not green_since: green_since=now
                 held=now-green_since
                 if held>=GREEN_CONFIRM_SECONDS and not green_latched:
-                    closed=close_all_shorts_on_green(ps)
-                    for s in closed: ps.pop(s,None); ps_cache.pop(s,None)
-                    ps_cache_ts=time.time(); green_latched=True
-                    msg(f"🟢 GREEN CONFIRMED {int(GREEN_CONFIRM_SECONDS)}s -> SHORTS CLOSED/BLOCKED",bal=False)
+                    b60=d.get("b60") or {}
+                    flow60_ok=(float(b60.get("net",0) or 0)>=0.40
+                               and float(b60.get("rs",0) or 0)>0
+                               and float(b60.get("positive",0) or 0)>=0.60)
+                    if flow60_ok:
+                        closed=close_all_shorts_on_green(ps)
+                        for s in closed: ps.pop(s,None); ps_cache.pop(s,None)
+                        ps_cache_ts=time.time(); green_latched=True
+                        msg(f"🟢 GREEN CONFIRMED {int(GREEN_CONFIRM_SECONDS)}s + 60s BREADTH CONFIRMED -> SHORTS CLOSED/BLOCKED",bal=False)
+                    else:
+                        logging.info("GREEN %.0fs BUT 60s BREADTH NOT CONFIRMED | net=%s rs=%s positive=%s | SHORTS KEPT OPEN",
+                                     held,b60.get("net"),b60.get("rs"),b60.get("positive"))
             else:
                 green_since=0
                 if green_latched:
