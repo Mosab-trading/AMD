@@ -241,7 +241,7 @@ def enter(s,d,setup=None,btc=None):
     cancel_algo(s)
     stop(s,d,sp)
 
-    favorable=.50/lev
+    favorable=1/lev
     tp=ep*(1+favorable) if d=="LONG" else ep*(1-favorable)
     algo_close(s,d,"TAKE_PROFIT_MARKET",tp,close_position=True)
     # V2.1: keep ONE exchange-side protective STOP only. Profit targets are managed
@@ -527,9 +527,9 @@ def manage():
         initial_qty=float(mine[s].get("initial_qty",abs(float(p["positionAmt"]))))
 
         try:
-            if r>=50:
+            if r>=100:
                 cancel_algo(s)
-                close(s,p,100,"TP +50% ROI FINAL")
+                close(s,p,100,"TP +100% ROI FINAL")
                 continue
         except Exception as e:
             logging.warning("%s profit-lock management failed: %s",s,e)
